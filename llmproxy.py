@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""toksec: transparent OpenAI-compatible LLM proxy + tok/sec dashboard.
+"""llmproxy: transparent OpenAI-compatible LLM proxy + tok/sec dashboard.
 
-    python3 toksec.py [upstream] [port] [logdir]  # default http://localhost:8080 8787 .
+    python3 llmproxy.py [upstream] [port] [logdir]  # default http://localhost:8080 8787 .
 
 Point any OpenAI-compatible client at http://localhost:PORT. Every request is
 forwarded byte-for-byte (streaming included); the only path not proxied is /
 (the dashboard) and /stats (the same numbers as JSON).
 
-Each completion is appended to logdir/toksec-<start time>-<llm port>.jsonl (default: current dir) as
+Each completion is appended to logdir/llmproxy-<start time>-<llm port>.jsonl (default: current dir) as
 one JSON line: prompt in, response out, token stats.
 """
 import sys, json, time, socket, urllib.request, urllib.error, urllib.parse, itertools, collections
@@ -17,7 +17,7 @@ UPSTREAM = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8080"
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8787
 LOGDIR = sys.argv[3] if len(sys.argv) > 3 else "."
 P = urllib.parse.urlparse(UPSTREAM)
-LOGFILE = (LOGDIR.rstrip("/") + f"/toksec-{time.strftime('%Y%m%d-%H%M%S')}-"
+LOGFILE = (LOGDIR.rstrip("/") + f"/llmproxy-{time.strftime('%Y%m%d-%H%M%S')}-"
            f"{P.port or (443 if P.scheme == 'https' else 80)}.jsonl")
 DROP = {"content-length", "transfer-encoding", "connection", "keep-alive", "host"}
 

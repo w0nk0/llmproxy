@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pi-proxy.py [on|off] [port] — point pi's configured LLM through the toksec proxy.
+"""pi-proxy.py [on|off] [port] — point pi's configured LLM through the llmproxy proxy.
 
 on  : reads pi's default provider from ~/.pi/agent/models.json, starts the proxy in
       front of whatever baseUrl pi is configured to use, and rewrites that baseUrl to
@@ -13,7 +13,7 @@ import json, os, shutil, subprocess, sys, urllib.parse
 CFG = os.path.expanduser("~/.pi/agent/models.json")
 SETTINGS = os.path.expanduser("~/.pi/agent/settings.json")
 BAK = CFG + ".orig"
-PROXY = os.path.expanduser("~/bin/LLMproxy/toksec.py")
+PROXY = os.path.expanduser("~/projects/LLMproxy/llmproxy.py")
 LOGDIR = os.path.expanduser("~/logs/llmproxy")
 
 STATE = sys.argv[1] if len(sys.argv) > 1 else "on"

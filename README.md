@@ -1,6 +1,6 @@
 # LLMproxy — transparent OpenAI proxy + tok/sec dashboard
 
-One file, Python stdlib only: `toksec.py`.
+One file, Python stdlib only: `llmproxy.py`.
 
 It sits in front of any OpenAI-compatible server (LM Studio, llama-server, ollama's
 `/v1` endpoint, …) and does two things:
@@ -13,9 +13,9 @@ It sits in front of any OpenAI-compatible server (LM Studio, llama-server, ollam
 ## Run
 
 ```bash
-python3 ~/bin/LLMproxy/toksec.py                                  # upstream :8080, proxy :8787, log .
-python3 ~/bin/LLMproxy/toksec.py http://localhost:11434 8790      # ollama, other port
-python3 ~/bin/LLMproxy/toksec.py http://127.0.0.1:8899 8787 ~/logs
+python3 ~/projects/LLMproxy/llmproxy.py                                  # upstream :8080, proxy :8787, log .
+python3 ~/projects/LLMproxy/llmproxy.py http://localhost:11434 8790      # ollama, other port
+python3 ~/projects/LLMproxy/llmproxy.py http://127.0.0.1:8899 8787 ~/logs
 ```
 
 | Arg | Default | Meaning |
@@ -39,11 +39,11 @@ goes to the upstream.
 ## Log
 
 One JSON line per successful completion (`200` on a path containing `completion`), appended
-to `<logdir>/toksec-<start time>-<upstream port>.jsonl`. The filename is fixed when the proxy
+to `<logdir>/llmproxy-<start time>-<upstream port>.jsonl`. The filename is fixed when the proxy
 starts, so separate runs never share a file:
 
 ```bash
-tail -f ~/logs/toksec-20261112-031135-8080.jsonl
+tail -f ~/logs/llmproxy-20261112-031135-8080.jsonl
 ```
 
 ```json
@@ -69,7 +69,7 @@ tail -f ~/logs/toksec-20261112-031135-8080.jsonl
 ## Selftest
 
 ```bash
-python3 ~/bin/LLMproxy/toksec.py --selftest   # -> selftest ok
+python3 ~/projects/LLMproxy/llmproxy.py --selftest   # -> selftest ok
 ```
 
 ## Harness switch helpers
@@ -82,8 +82,8 @@ model id, only the `baseUrl` moves.
 | `pi-proxy.py [on\|off] [port]` | reads pi's `defaultProvider` from `~/.pi/agent/models.json`, starts the proxy in front of that upstream if nothing is listening, rewrites the provider's `baseUrl` to `http://localhost:<port>/v1`, and saves the original file as `models.json.orig`. `off` restores it. |
 
 ```bash
-~/bin/LLMproxy/pi-proxy.py on      # pi now talks to the proxy; restart pi to pick it up
-~/bin/LLMproxy/pi-proxy.py off     # pi back on its real upstream
+~/projects/LLMproxy/pi-proxy.py on      # pi now talks to the proxy; restart pi to pick it up
+~/projects/LLMproxy/pi-proxy.py off     # pi back on its real upstream
 ```
 
 Not covered: opencode (its `~/.config/opencode/opencode.jsonc` has no provider to rewrite —
