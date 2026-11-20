@@ -10,7 +10,7 @@ forwarded byte-for-byte (streaming included); the only path not proxied is /
 Each completion is appended to logdir/toksec-<start time>-<llm port>.jsonl (default: current dir) as
 one JSON line: prompt in, response out, token stats.
 """
-import sys, json, time, urllib.request, urllib.error, urllib.parse, itertools, collections
+import sys, json, time, socket, urllib.request, urllib.error, urllib.parse, itertools, collections
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 UPSTREAM = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8080"
@@ -98,6 +98,16 @@ def page():
             f"<h2>last {len(s['last'])} of {s['requests']} requests, {s['tokens']} tok</h2>"
             f"{rows(s['last'], 'd')}"
             f"<p>avg {s['avg_tok_s']} tok/s (non-streaming tok/s includes prefill)</p></body></html>")
+
+
+class DualStackServer(ThreadingHTTPServer):
+    """Listen on every interface, IPv4 and IPv6 (one dual-stack socket on ::)."""
+    address_family = socket.AF_INET6
+    daemon_threads = True
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
 
 
 class H(BaseHTTPRequestHandler):
@@ -214,4 +224,8 @@ if __name__ == "__main__":
         raise SystemExit(selftest())
     print(f"proxy on :{PORT} -> {UPSTREAM}, dashboard http://localhost:{PORT}/, "
           f"log {LOGFILE}")
-    ThreadingHTTPServer(("", PORT), H).serve_forever()
+    try:
+        srv = DualStackServer(("::", PORT), H)
+    except OSError:                       # no IPv6 on this host: plain IPv4 on all interfaces
+        srv = ThreadingHTTPServer(("0.0.0.0", PORT), H)
+    srv.serve_forever()
