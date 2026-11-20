@@ -48,6 +48,11 @@ answers it itself (streaming or not, matching the request) and does **not** forw
 LLM or log it. The reply lists the live request, the last five (tok/s, tokens, ttft, model)
 and the running average. No harness changes needed, it only has to let you send the text.
 
+`%tps_all` (also `;tps_all`, `::tps_all`) reports totals since the proxy started instead:
+average generation speed, peak request, request and token counts, generation time, and
+wall-clock throughput over the whole uptime (idle time included). The `%tps` reply hints at it.
+The totals are kept in memory and reset on restart; `%tps` itself averages only the last 50 requests.
+
 Caveats: the harness keeps the `%tps` exchange in its conversation history, so later requests
 carry it; and a harness that intercepts your trigger will never
 send it, in which case try another prefix, or use the dashboard or `/stats`.

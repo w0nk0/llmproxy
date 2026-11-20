@@ -25,8 +25,18 @@ LOGFILE = (LOGDIR.rstrip("/") + f"/llmproxy-{time.strftime('%Y%m%d-%H%M%S')}-"
 DROP = {"content-length", "transfer-encoding", "connection", "keep-alive", "host"}
 
 LOG = collections.deque(maxlen=50)  # finished requests
+TOTAL = {"requests": 0, "tokens": 0, "secs": 0.0, "peak": 0.0, "since": time.time()}  # since start
 LIVE = {}                           # in-flight requests, keyed by counter
 KEY = itertools.count()
+
+
+def record(entry):
+    """Add a finished request to the recent list and the since-start totals."""
+    LOG.append(entry)
+    TOTAL["requests"] += 1
+    TOTAL["tokens"] += entry["tokens"]
+    TOTAL["secs"] += entry["secs"]
+    TOTAL["peak"] = max(TOTAL["peak"], entry["tok_s"])
 
 
 def dump(prompt, entry, out):
@@ -106,7 +116,7 @@ def page():
 # Harnesses swallow most leading "/" or "!" input, so the trigger is a plain word with a
 # prefix no harness uses, matched as a whole token anywhere in the last message.
 # "/tps" stays for clients that pass it through.
-TRIGGERS = {"%tps", ";tps", "::tps", "/tps", "/tokens"}
+TRIGGERS = {p + w for p in ("%", ";", "::") for w in ("tps", "tps_all")} | {"/tps", "/tokens"}
 
 
 def command(body):
@@ -123,17 +133,32 @@ def command(body):
     return next((t for t in (c or "").lower().split() if t in TRIGGERS), None)
 
 
+def report_all():
+    t = TOTAL
+    up = time.time() - t["since"]
+    if not t["requests"]:
+        return f"llmproxy since start ({up / 60:.0f} min): no completions measured yet."
+    return "\n".join([
+        f"llmproxy tok/s since start ({time.strftime('%F %T', time.localtime(t['since']))}, up {up / 60:.0f} min)",
+        f"- generation speed: {t['tokens'] / t['secs']:.1f} tok/s average" if t["secs"] else
+        "- generation speed: n/a",
+        f"- peak request: {t['peak']} tok/s",
+        f"- {t['requests']} requests, {t['tokens']} tok in {t['secs']:.0f} s of generation",
+        f"- wall-clock throughput: {t['tokens'] / up:.2f} tok/s over the whole uptime (includes idle time)"])
+
+
 def report():
     s = snapshot()
     if not (s["live"] or s["last"]):
-        return "llmproxy: no completions measured yet."
+        return "llmproxy: no completions measured yet.\n(send %tps_all for totals since start)"
     lines = ["llmproxy tok/s"]
     for e in s["live"]:
         lines.append(f"- live: {e['tok_s']} tok/s, {e['tokens']} tok so far, {e['ttft_ms']} ms ttft")
     for i, e in enumerate(s["last"][:5]):
         lines.append(f"- {'last' if i == 0 else f'-{i}  '}: {e['tok_s']} tok/s, {e['tokens']} tok, "
                      f"{e['ttft_ms']} ms ttft, {e['model']}")
-    lines.append(f"- average over {s['requests']} requests: {s['avg_tok_s']} tok/s ({s['tokens']} tok)")
+    lines.append(f"- average over the last {s['requests']} requests: {s['avg_tok_s']} tok/s ({s['tokens']} tok)")
+    lines.append("(send %tps_all for totals since the proxy started)")
     return "\n".join(lines)
 
 
@@ -175,13 +200,14 @@ class H(BaseHTTPRequestHandler):
             return self.wfile.write(body)
 
         body = self.rfile.read(int(self.headers.get("content-length") or 0))
-        if self.command == "POST" and "chat/completions" in self.path and command(body):
+        trigger = command(body) if self.command == "POST" and "chat/completions" in self.path else None
+        if trigger:
             try:                           # answered here, never sent upstream, not logged
                 req = json.loads(body)
             except ValueError:
                 req = {}
             stream = bool(req.get("stream"))
-            data = completion(report(), req.get("model"), stream)
+            data = completion(report_all() if trigger.endswith("_all") else report(), req.get("model"), stream)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream" if stream else "application/json")
             self.send_header("Content-Length", str(len(data)))
@@ -240,7 +266,7 @@ class H(BaseHTTPRequestHandler):
             e["secs"] = e["last"] - e["first"] if e["first"] else time.time() - t0
             e["tok_s"] = round(rate(e), 1)
             e["ttft_ms"] = round((e["first"] - t0) * 1000) if e["first"] else 0
-            LOG.append({k: v for k, v in e.items() if k not in ("t0", "out")})
+            record({k: v for k, v in e.items() if k not in ("t0", "out")})
             dump(body, e, e["out"])
             del LIVE[key]
         else:
@@ -261,7 +287,7 @@ class H(BaseHTTPRequestHandler):
             if code == 200 and "/completion" in self.path:
                 entry = {"path": self.path, "model": model, "tokens": tok, "secs": secs,
                          "tok_s": round(tok / secs, 1) if secs else 0.0, "ttft_ms": 0}
-                LOG.append(entry)
+                record(entry)
                 dump(body, entry, out)
 
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_HEAD = route
@@ -283,6 +309,9 @@ def selftest():
         body = json.dumps({"messages": [{"role": "user", "content": "hi"},
                                         {"role": "user", "content": content}]})
         assert command(body), content
+    assert command(json.dumps({"messages": [{"role": "user", "content": "%tps_all"}]})) == "%tps_all"
+    record({"path": "/v1/chat/completions", "model": "m", "tokens": 10, "secs": 2.0, "tok_s": 5.0, "ttft_ms": 1})
+    assert "5.0 tok/s average" in report_all() and "%tps_all" in report()
     assert not command(json.dumps({"messages": [{"role": "user", "content": "what is tps?"}]}))
     assert not command(json.dumps({"messages": [{"role": "user", "content": "%tps"},
                                                 {"role": "tool", "content": "x"}]}))
