@@ -7,7 +7,7 @@ Point any OpenAI-compatible client at http://localhost:PORT. Every request is
 forwarded byte-for-byte (streaming included); the only path not proxied is /
 (the dashboard) and /stats (the same numbers as JSON).
 
-Slash command: send `/tps` (or `/tokens`) as a chat message from any client. The proxy
+Speed command: send `%tps` (also `;tps`, `::tps`, `/tps`) as a chat message from any client. The proxy
 answers it itself with the current tok/s stats as an assistant reply; nothing reaches the LLM.
 
 Each completion is appended to logdir/llmproxy-<start time>-<llm port>.jsonl (default: current dir) as
@@ -103,21 +103,24 @@ def page():
             f"<p>avg {s['avg_tok_s']} tok/s (non-streaming tok/s includes prefill)</p></body></html>")
 
 
-COMMANDS = ("/tps", "/tokens")
+# Harnesses swallow most leading "/" or "!" input, so the trigger is a plain word with a
+# prefix no harness uses, matched as a whole token anywhere in the last message.
+# "/tps" stays for clients that pass it through.
+TRIGGERS = {"%tps", ";tps", "::tps", "/tps", "/tokens"}
 
 
 def command(body):
-    """Return the slash command if the last user message of a chat request is one."""
+    """Return the trigger if the final message of a chat request contains one."""
     try:
-        msgs = json.loads(body).get("messages") or []
-        last = next(m for m in reversed(msgs) if m.get("role") == "user")
-    except (ValueError, StopIteration, AttributeError):
+        last = (json.loads(body).get("messages") or [])[-1]
+        if last.get("role") != "user":    # e.g. tool result: an agent loop is mid-turn
+            return None
+    except (ValueError, IndexError, AttributeError):
         return None
     c = last.get("content")
     if isinstance(c, list):               # content-parts form
-        c = "".join(x.get("text", "") for x in c if isinstance(x, dict))
-    c = (c or "").strip().lower()
-    return c if c in COMMANDS else None
+        c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+    return next((t for t in (c or "").lower().split() if t in TRIGGERS), None)
 
 
 def report():
@@ -276,11 +279,13 @@ def selftest():
     assert (ev, ch, us) == (2, 11, 2), (ev, ch, us)
     n, txt, u = sse(b'data: {"choices":[{"delta":{"content":"Hello"}}]}\n')
     assert (n, txt, u) == (1, "Hello", None)
-    for content in ("/tps", "  /TPS\n", [{"type": "text", "text": "/tokens"}]):
+    for content in ("/tps", "  %TPS\n", ";tps", "please ::tps now", [{"type": "text", "text": "/tokens"}]):
         body = json.dumps({"messages": [{"role": "user", "content": "hi"},
                                         {"role": "user", "content": content}]})
         assert command(body), content
-    assert not command(json.dumps({"messages": [{"role": "user", "content": "what is /tps?"}]}))
+    assert not command(json.dumps({"messages": [{"role": "user", "content": "what is tps?"}]}))
+    assert not command(json.dumps({"messages": [{"role": "user", "content": "%tps"},
+                                                {"role": "tool", "content": "x"}]}))
     assert not command(b"not json")
     assert json.loads(completion("x", "m", False))["choices"][0]["message"]["content"] == "x"
     assert completion("x", "m", True).endswith(b"data: [DONE]\n\n")
