@@ -2,6 +2,7 @@
 """llmproxy: transparent OpenAI-compatible LLM proxy + tok/sec dashboard.
 
     python3 llmproxy.py [upstream] [port] [logdir]  # default http://localhost:8080 8787 .
+    python3 llmproxy.py                             # no arguments: reuse the last run's parameters
 
 Point any OpenAI-compatible client at http://localhost:PORT. Every request is
 forwarded byte-for-byte (streaming included); the only path not proxied is /
@@ -13,12 +14,39 @@ answers it itself with the current tok/s stats as an assistant reply; nothing re
 Each completion is appended to logdir/llmproxy-<start time>-<llm port>.jsonl (default: current dir) as
 one JSON line: prompt in, response out, token stats.
 """
-import sys, json, time, socket, urllib.request, urllib.error, urllib.parse, itertools, collections
+import os, sys, json, time, socket, urllib.request, urllib.error, urllib.parse, itertools, collections
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-UPSTREAM = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8080"
-PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8787
-LOGDIR = sys.argv[3] if len(sys.argv) > 3 else "."
+DEFAULTS = ["http://localhost:8080", "8787", "."]
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+                     "llmproxy", "last.json")
+
+
+def load_cached():
+    """Start parameters of the most recent run, or None."""
+    try:
+        with open(CACHE) as f:
+            c = json.load(f)
+        return [str(c["upstream"]), str(c["port"]), str(c["logdir"])]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def save_cached(upstream, port, logdir):
+    try:
+        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+        with open(CACHE, "w") as f:
+            json.dump({"upstream": upstream, "port": port, "logdir": os.path.abspath(logdir)}, f)
+    except OSError as e:
+        print(f"proxy: cannot cache start parameters in {CACHE}: {e}")
+
+
+ARGS = sys.argv[1:]
+SELFTEST = ARGS[:1] == ["--selftest"]
+FROM_CACHE = not ARGS and load_cached()      # started without parameters: reuse the last ones
+# missing trailing arguments fall back to the defaults
+UPSTREAM, PORT, LOGDIR = (FROM_CACHE or ARGS + DEFAULTS[len(ARGS):])[:3]
+PORT = int(PORT)
 P = urllib.parse.urlparse(UPSTREAM)
 LOGFILE = (LOGDIR.rstrip("/") + f"/llmproxy-{time.strftime('%Y%m%d-%H%M%S')}-"
            f"{P.port or (443 if P.scheme == 'https' else 80)}.jsonl")
@@ -318,12 +346,16 @@ def selftest():
     assert not command(b"not json")
     assert json.loads(completion("x", "m", False))["choices"][0]["message"]["content"] == "x"
     assert completion("x", "m", True).endswith(b"data: [DONE]\n\n")
+    assert load_cached is not None and DEFAULTS[1] == "8787"
     print("selftest ok")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--selftest":
+    if SELFTEST:
         raise SystemExit(selftest())
+    save_cached(UPSTREAM, PORT, LOGDIR)
+    if FROM_CACHE:
+        print(f"proxy: no parameters given, reusing the last ones from {CACHE}")
     print(f"proxy on :{PORT} -> {UPSTREAM}, dashboard http://localhost:{PORT}/, "
           f"log {LOGFILE}")
     try:

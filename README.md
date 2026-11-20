@@ -26,6 +26,12 @@ python3 ~/projects/LLMproxy/llmproxy.py http://127.0.0.1:8899 8787 ~/logs
 
 The proxy listens on all interfaces, IPv4 and IPv6.
 
+Started with **no arguments**, it reuses the parameters of the most recent run (cached in
+`~/.cache/llmproxy/last.json`, or under `$XDG_CACHE_HOME`) and says so on startup. Any run with
+arguments, even just the first, replaces the cache; omitted trailing arguments fall back to the
+defaults, not to the cached values. With no cache yet it uses the defaults. The log directory is
+cached as an absolute path.
+
 Then point the client at `http://localhost:<port>` (e.g. `base_url="http://localhost:8787/v1"`).
 
 ## Dashboard
