@@ -24,6 +24,8 @@ python3 ~/projects/LLMproxy/llmproxy.py http://127.0.0.1:8899 8787 ~/logs
 | 2 `port` | `8787` | port the proxy listens on |
 | 3 `logdir` | `.` (current dir) | directory for the request/response log |
 
+The proxy listens on all interfaces, IPv4 and IPv6.
+
 Then point the client at `http://localhost:<port>` (e.g. `base_url="http://localhost:8787/v1"`).
 
 ## Dashboard
@@ -33,8 +35,20 @@ Then point the client at `http://localhost:<port>` (e.g. `base_url="http://local
   path, model, tokens, tok/s and time-to-first-token.
 - `http://localhost:8787/stats` — the same numbers as JSON, for scripts.
 
-These two paths are the only ones **not** proxied. Everything else, including `/v1/models`,
+These two paths (and the `/tps` chat command) are the only things **not** proxied. Everything else, including `/v1/models`,
 goes to the upstream.
+
+## Slash command: `/tps`
+
+For harnesses that show no speed numbers. Type `/tps` (or `/tokens`) as an ordinary chat
+message; the proxy recognises it as the last user message of a `chat/completions` request,
+answers it itself (streaming or not, matching the request) and does **not** forward it to the
+LLM or log it. The reply lists the live request, the last five (tok/s, tokens, ttft, model)
+and the running average. No harness changes needed, it only has to let you send the text.
+
+Caveats: the harness keeps the `/tps` exchange in its conversation history, so later requests
+carry it; and a harness that handles `/...` itself (client-side slash commands) will never
+send it, in which case use the dashboard or `/stats`.
 
 ## Log
 

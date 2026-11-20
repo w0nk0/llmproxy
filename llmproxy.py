@@ -7,6 +7,9 @@ Point any OpenAI-compatible client at http://localhost:PORT. Every request is
 forwarded byte-for-byte (streaming included); the only path not proxied is /
 (the dashboard) and /stats (the same numbers as JSON).
 
+Slash command: send `/tps` (or `/tokens`) as a chat message from any client. The proxy
+answers it itself with the current tok/s stats as an assistant reply; nothing reaches the LLM.
+
 Each completion is appended to logdir/llmproxy-<start time>-<llm port>.jsonl (default: current dir) as
 one JSON line: prompt in, response out, token stats.
 """
@@ -100,6 +103,50 @@ def page():
             f"<p>avg {s['avg_tok_s']} tok/s (non-streaming tok/s includes prefill)</p></body></html>")
 
 
+COMMANDS = ("/tps", "/tokens")
+
+
+def command(body):
+    """Return the slash command if the last user message of a chat request is one."""
+    try:
+        msgs = json.loads(body).get("messages") or []
+        last = next(m for m in reversed(msgs) if m.get("role") == "user")
+    except (ValueError, StopIteration, AttributeError):
+        return None
+    c = last.get("content")
+    if isinstance(c, list):               # content-parts form
+        c = "".join(x.get("text", "") for x in c if isinstance(x, dict))
+    c = (c or "").strip().lower()
+    return c if c in COMMANDS else None
+
+
+def report():
+    s = snapshot()
+    if not (s["live"] or s["last"]):
+        return "llmproxy: no completions measured yet."
+    lines = ["llmproxy tok/s"]
+    for e in s["live"]:
+        lines.append(f"- live: {e['tok_s']} tok/s, {e['tokens']} tok so far, {e['ttft_ms']} ms ttft")
+    for i, e in enumerate(s["last"][:5]):
+        lines.append(f"- {'last' if i == 0 else f'-{i}  '}: {e['tok_s']} tok/s, {e['tokens']} tok, "
+                     f"{e['ttft_ms']} ms ttft, {e['model']}")
+    lines.append(f"- average over {s['requests']} requests: {s['avg_tok_s']} tok/s ({s['tokens']} tok)")
+    return "\n".join(lines)
+
+
+def completion(text, model, stream):
+    """Synthetic OpenAI chat completion (or SSE stream) carrying `text`."""
+    base = {"id": "llmproxy-cmd", "created": int(time.time()), "model": model or "llmproxy"}
+    if not stream:
+        return json.dumps({**base, "object": "chat.completion", "choices": [{
+            "index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": text}}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}).encode()
+    ev = lambda delta, fin=None: b"data: " + json.dumps({**base, "object": "chat.completion.chunk",
+        "choices": [{"index": 0, "delta": delta, "finish_reason": fin}]}).encode() + b"\n\n"
+    return (ev({"role": "assistant", "content": ""}) + ev({"content": text}) + ev({}, "stop")
+            + b"data: [DONE]\n\n")
+
+
 class DualStackServer(ThreadingHTTPServer):
     """Listen on every interface, IPv4 and IPv6 (one dual-stack socket on ::)."""
     address_family = socket.AF_INET6
@@ -125,6 +172,19 @@ class H(BaseHTTPRequestHandler):
             return self.wfile.write(body)
 
         body = self.rfile.read(int(self.headers.get("content-length") or 0))
+        if self.command == "POST" and "chat/completions" in self.path and command(body):
+            try:                           # answered here, never sent upstream, not logged
+                req = json.loads(body)
+            except ValueError:
+                req = {}
+            stream = bool(req.get("stream"))
+            data = completion(report(), req.get("model"), stream)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream" if stream else "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            return self.wfile.write(data)
+
         headers = {k: v for k, v in self.headers.items() if k.lower() not in DROP}
         req = urllib.request.Request(UPSTREAM + self.path, body or None, headers, method=self.command)
         t0 = time.time()
@@ -216,6 +276,14 @@ def selftest():
     assert (ev, ch, us) == (2, 11, 2), (ev, ch, us)
     n, txt, u = sse(b'data: {"choices":[{"delta":{"content":"Hello"}}]}\n')
     assert (n, txt, u) == (1, "Hello", None)
+    for content in ("/tps", "  /TPS\n", [{"type": "text", "text": "/tokens"}]):
+        body = json.dumps({"messages": [{"role": "user", "content": "hi"},
+                                        {"role": "user", "content": content}]})
+        assert command(body), content
+    assert not command(json.dumps({"messages": [{"role": "user", "content": "what is /tps?"}]}))
+    assert not command(b"not json")
+    assert json.loads(completion("x", "m", False))["choices"][0]["message"]["content"] == "x"
+    assert completion("x", "m", True).endswith(b"data: [DONE]\n\n")
     print("selftest ok")
 
 
