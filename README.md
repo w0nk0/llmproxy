@@ -1,0 +1,92 @@
+# LLMproxy — transparent OpenAI proxy + tok/sec dashboard
+
+One file, Python stdlib only: `toksec.py`.
+
+It sits in front of any OpenAI-compatible server (LM Studio, llama-server, ollama's
+`/v1` endpoint, …) and does two things:
+
+1. **Passes everything through byte-for-byte** — request bodies, headers, SSE streams,
+   upstream 4xx/5xx. Clients see the same bytes they would see talking to the upstream
+   directly, so any OpenAI-compatible client works unchanged.
+2. **Measures generation speed** and shows it on a tiny web page.
+
+## Run
+
+```bash
+python3 ~/bin/LLMproxy/toksec.py                                  # upstream :8080, proxy :8787, log .
+python3 ~/bin/LLMproxy/toksec.py http://localhost:11434 8790      # ollama, other port
+python3 ~/bin/LLMproxy/toksec.py http://127.0.0.1:8899 8787 ~/logs
+```
+
+| Arg | Default | Meaning |
+|-----|---------|---------|
+| 1 `upstream` | `http://localhost:8080` | base URL of the LLM server |
+| 2 `port` | `8787` | port the proxy listens on |
+| 3 `logdir` | `.` (current dir) | directory for the request/response log |
+
+Then point the client at `http://localhost:<port>` (e.g. `base_url="http://localhost:8787/v1"`).
+
+## Dashboard
+
+- `http://localhost:8787/` — auto-refreshing page (1 s): big number is the live tok/s
+  (or the session average when nothing is generating), then one row per request with
+  path, model, tokens, tok/s and time-to-first-token.
+- `http://localhost:8787/stats` — the same numbers as JSON, for scripts.
+
+These two paths are the only ones **not** proxied. Everything else, including `/v1/models`,
+goes to the upstream.
+
+## Log
+
+One JSON line per successful completion (`200` on a path containing `completion`), appended
+to `<logdir>/toksec-<start time>-<upstream port>.jsonl`. The filename is fixed when the proxy
+starts, so separate runs never share a file:
+
+```bash
+tail -f ~/logs/toksec-20261112-031135-8080.jsonl
+```
+
+```json
+{"t": "2026-11-12 03:11:35",
+ "prompt": {"model": "...", "stream": true, "messages": [{"role": "user", "content": "ping"}]},
+ "out": "full response text, streaming deltas reassembled",
+ "model": "qwen3.8-flash-next-coder-iq1_m", "tokens": 40, "tok_s": 28.5, "ttft_ms": 1314}
+```
+
+`prompt` is the parsed request body, so it contains the full incoming conversation.
+
+## Notes / limits
+
+- Token count is `usage.completion_tokens` when the server sends it; otherwise it falls back
+  to counting SSE delta events (or chars/4, whichever is larger). Servers that batch deltas
+  or use non-Latin scripts will be off.
+- tok/s is measured **at the proxy**: first delta byte to last delta byte. Any buffering
+  between the upstream and the proxy is folded into the number. Non-streaming tok/s includes
+  prefill (the page says so).
+- HTTP/1.1 only (no HTTP/2), no retry if the client hangs up mid-stream.
+- Log writes are append-only, no rotation, and prompts/responses are stored in the clear.
+
+## Selftest
+
+```bash
+python3 ~/bin/LLMproxy/toksec.py --selftest   # -> selftest ok
+```
+
+## Harness switch helpers
+
+Point a harness at the proxy without changing which model it uses — same provider, same
+model id, only the `baseUrl` moves.
+
+| Script | What it does |
+|--------|--------------|
+| `pi-proxy.py [on\|off] [port]` | reads pi's `defaultProvider` from `~/.pi/agent/models.json`, starts the proxy in front of that upstream if nothing is listening, rewrites the provider's `baseUrl` to `http://localhost:<port>/v1`, and saves the original file as `models.json.orig`. `off` restores it. |
+
+```bash
+~/bin/LLMproxy/pi-proxy.py on      # pi now talks to the proxy; restart pi to pick it up
+~/bin/LLMproxy/pi-proxy.py off     # pi back on its real upstream
+```
+
+Not covered: opencode (its `~/.config/opencode/opencode.jsonc` has no provider to rewrite —
+adding one is a different edit), and claude / codex, whose clients speak the Anthropic or
+Codex wire APIs that a byte-for-byte OpenAI proxy cannot serve. Ask if you want those wired
+up; they need a translating proxy, not this one.

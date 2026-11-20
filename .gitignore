@@ -1,0 +1,4 @@
+# request/response logs contain full prompts in the clear
+*.jsonl
+x.txt
+__pycache__/
