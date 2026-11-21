@@ -36,10 +36,24 @@ Then point the client at `http://localhost:<port>` (e.g. `base_url="http://local
 
 ## Dashboard
 
-- `http://localhost:8787/` — auto-refreshing page (1 s): big number is the live tok/s
-  (or the session average when nothing is generating), then one row per request with
-  path, model, tokens, tok/s and time-to-first-token.
-- `http://localhost:8787/stats` — the same numbers as JSON, for scripts.
+- `http://localhost:8787/` — a live page (polls once a second, light or dark to match the system):
+  - the big number is the **current decode speed** (while generating, averaged over the last 10+ tokens),
+    or the average of the last requests when idle; a status chip shows **idle**, **prefill** (with the
+    running time and the prompt size) or **generating**;
+  - **Inference (decode) speed** graph: tok/s over a sliding window of **at least 10 tokens** (buttons for
+    25 and 50), against the output token position. One line per recent request (the last 8), the live one
+    in amber. The window is what keeps speculative-decoding bursts from spiking the line;
+  - **Prefill speed** graph: one bar per request, *new* prompt tokens (cache hits left out) ÷ time to first
+    token. The prompt size is the server's own `usage.prompt_tokens` when it sends one; otherwise a
+    chars/4 estimate, drawn fainter and marked with `~` in the table;
+  - a table of the recent requests: prompt, cached, prefill tok/s, time to first token, output tokens,
+    decode tok/s. Hover a graph for the exact numbers.
+- `http://localhost:8787/stats` — the same numbers as JSON, for scripts. `?window=N` sets the decode
+  window (default and minimum 10). Besides the earlier fields it has `pending` (requests still in prefill),
+  `decode` (the curves), `prefill` (one entry per request) and totals since start.
+
+Prefill and decode are only separable for **streaming** requests; a non-streaming request is one
+number. Very small prompts show a low prefill rate because the fixed time to first token dominates.
 
 These two paths (and the `%tps` chat command) are the only things **not** proxied. Everything else, including `/v1/models`,
 goes to the upstream.
@@ -77,7 +91,8 @@ tail -f ~/logs/llmproxy-20261112-031135-8080.jsonl
 {"t": "2026-11-12 03:11:35",
  "prompt": {"model": "...", "stream": true, "messages": [{"role": "user", "content": "ping"}]},
  "out": "full response text, streaming deltas reassembled",
- "model": "qwen3.8-flash-next-coder-iq1_m", "tokens": 40, "tok_s": 28.5, "ttft_ms": 1314}
+ "model": "qwen3.8-flash-next-coder-iq1_m", "tokens": 40, "tok_s": 28.5, "ttft_ms": 1314,
+ "prompt_tokens": 1200, "cached_tokens": 0, "prefill_tok_s": 913}
 ```
 
 `prompt` is the parsed request body, so it contains the full incoming conversation.

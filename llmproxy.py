@@ -54,8 +54,11 @@ DROP = {"content-length", "transfer-encoding", "connection", "keep-alive", "host
 
 LOG = collections.deque(maxlen=50)  # finished requests
 TOTAL = {"requests": 0, "tokens": 0, "secs": 0.0, "peak": 0.0, "since": time.time()}  # since start
-LIVE = {}                           # in-flight requests, keyed by counter
+LIVE = {}                           # in-flight requests that are streaming, keyed by counter
+PENDING = {}                        # requests sent upstream, no response yet (prefill phase)
 KEY = itertools.count()
+KEEP_EV = 8                         # finished requests that keep their per-token timeline (for the decode graph)
+MIN_WINDOW = 10                     # the decode graph averages over at least this many tokens
 
 
 def record(entry):
@@ -65,6 +68,8 @@ def record(entry):
     TOTAL["tokens"] += entry["tokens"]
     TOTAL["secs"] += entry["secs"]
     TOTAL["peak"] = max(TOTAL["peak"], entry["tok_s"])
+    for old in list(LOG)[:-KEEP_EV]:    # only the newest few keep their timeline
+        old.pop("ev", None)
 
 
 def dump(prompt, entry, out):
@@ -76,7 +81,10 @@ def dump(prompt, entry, out):
         with open(LOGFILE, "a") as f:
             f.write(json.dumps({"t": time.strftime("%F %T"), "prompt": prompt, "out": out,
                                 "model": entry["model"], "tokens": entry["tokens"],
-                                "tok_s": entry["tok_s"], "ttft_ms": entry["ttft_ms"]},
+                                "tok_s": entry["tok_s"], "ttft_ms": entry["ttft_ms"],
+                                "prompt_tokens": entry.get("prompt_tokens"),
+                                "cached_tokens": entry.get("cached"),
+                                "prefill_tok_s": entry.get("prefill_tok_s")},
                                ensure_ascii=False) + "\n")
     except OSError as e:
         print(f"proxy: cannot write {LOGFILE}: {e}")
@@ -84,61 +92,350 @@ def dump(prompt, entry, out):
 # shortcut: 1 SSE delta event = 1 token, with max(events, chars/4) as fallback
 # for servers that batch deltas. upgrade: trust usage.completion_tokens only.
 def sse(line):
-    """-> (delta_events, delta_text, usage_completion_tokens) for one SSE line."""
+    """-> (delta_events, delta_text, usage dict or None) for one SSE line."""
     if not line.startswith(b"data:"):
         return 0, "", None
     try:
         d = json.loads(line[5:].strip())
     except ValueError:
         return 0, "", None
-    if d.get("usage"):
-        return 0, "", d["usage"].get("completion_tokens")
+    if isinstance(d, dict) and d.get("usage"):
+        return 0, "", d["usage"]
     txt = ""
-    for c in d.get("choices", []):
+    for c in d.get("choices", []) if isinstance(d, dict) else []:
         delta = c.get("delta") or c
         txt += delta.get("content") or delta.get("reasoning_content") or delta.get("text") or ""
     return (1 if txt else 0), txt, None
+
+
+def usage_numbers(u):
+    """-> (completion_tokens, prompt_tokens, cached_prompt_tokens), each 0/None when the server did not say."""
+    u = u or {}
+    cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens")
+    return u.get("completion_tokens") or 0, u.get("prompt_tokens"), cached
 
 
 def est(text):
     return max(1, len(text) // 4)
 
 
+def prompt_estimate(body):
+    """Rough prompt size (chars/4) from a request body, for servers that report no prompt_tokens."""
+    try:
+        j = json.loads(body)
+        chars = len(j["prompt"]) if isinstance(j.get("prompt"), str) else 0
+        for m in j.get("messages") or []:
+            c = m.get("content")
+            chars += (sum(len(x.get("text", "")) for x in c if isinstance(x, dict)) if isinstance(c, list)
+                      else len(c) if isinstance(c, str) else 0)
+        if j.get("tools"):
+            chars += len(json.dumps(j["tools"]))
+        return max(1, chars // 4) if chars else 0
+    except (ValueError, TypeError, AttributeError):
+        return 0
+
+
+def event_tokens(txt):
+    """Tokens in one SSE delta: one, unless the server batches (long text per event)."""
+    return 1 if len(txt) <= 12 else max(1, len(txt) // 4)
+
+
 def rate(e):
     return e["tokens"] / (e["last"] - e["first"]) if e["first"] and e["last"] > e["first"] else 0.0
 
 
-def snapshot():
+def prefill_stats(prompt, cached, ttft_ms):
+    """-> (new prompt tokens, prefill tok/s or None): what was really read this turn / time to first token."""
+    new = max(0, (prompt or 0) - (cached or 0))
+    return new, (round(new / (ttft_ms / 1000)) if new >= 1 and ttft_ms > 0 else None)
+
+
+def curve(ev, scale=1.0, win=MIN_WINDOW, maxpts=200):
+    """Decode speed along one request: [(output token index, tok/s over the last >= win tokens)].
+
+    ev is [(seconds since the first token, tokens so far), ...]. A window always spans at least `win`
+    tokens, so one slow or one bursty token (speculative drafts arrive together) does not spike the line.
+    """
+    win = max(MIN_WINDOW, int(win))
+    pts, j = [], 0
+    for i in range(1, len(ev)):
+        t, c = ev[i][0], ev[i][1] * scale
+        while j + 1 < i and c - ev[j + 1][1] * scale >= win:
+            j += 1
+        tj, cj = ev[j][0], ev[j][1] * scale
+        if c - cj >= win and t > tj:
+            pts.append((round(c), round((c - cj) / (t - tj), 1)))
+    if len(pts) > maxpts:
+        step = -(-len(pts) // maxpts)
+        pts = pts[::step] + ([pts[-1]] if (len(pts) - 1) % step else [])
+    return pts
+
+
+def clean(e):
+    """A request entry for JSON: rounded, without the raw timeline and the response text."""
+    return {k: (round(v, 1) if isinstance(v, float) else v) for k, v in e.items()
+            if k not in ("t0", "ev", "out", "scaled", "prompt_guess")}
+
+
+def snapshot(window=MIN_WINDOW):
+    window = max(MIN_WINDOW, int(window))
     done = list(LOG)
-    live = [e for e in LIVE.values() if e["first"]]
+    live = [e for e in list(LIVE.values()) if e["first"]]
+    now = time.time()
+    pending = [{"id": e["id"], "path": e["path"], "model": e["model"], "prompt_guess": e["prompt_guess"],
+                "elapsed_s": round(now - e["t0"], 1)}
+               for e in list(PENDING.values()) + [e for e in list(LIVE.values()) if not e["first"]]]
     tok = sum(r["tokens"] for r in done)
     sec = sum(r["secs"] for r in done)
+    decode = []
+    for e, is_live in [(r, False) for r in done[-KEEP_EV:]] + [(e, True) for e in live]:
+        if e.get("ev"):
+            scale = (e["tokens"] / e["ev"][-1][1]) if (not is_live and e.get("scaled") and e["ev"][-1][1]) else 1.0
+            decode.append({"id": e.get("id"), "live": is_live, "start": round(e.get("start", 0), 1),
+                           "model": e["model"], "tokens": e["tokens"],
+                           "points": curve(e["ev"], scale, window)})
+    roll = [p[1] for d in decode for p in d["points"]]
     return {
         "requests": len(done),
         "tokens": tok,
         "avg_tok_s": round(tok / sec, 1) if sec else 0.0,
-        "live": [{k: (round(v, 1) if isinstance(v, float) else v) for k, v in e.items()
-                  if k != "t0"} | {"ttft_ms": round((e["first"] - e["t0"]) * 1000),
-                                   "tok_s": round(rate(e), 1)}
+        "window": window,
+        "uptime_s": round(now - TOTAL["since"]),
+        "total_requests": TOTAL["requests"],
+        "total_tokens": TOTAL["tokens"],
+        "peak_request_tok_s": TOTAL["peak"],
+        "peak_rolling_tok_s": max(roll) if roll else 0.0,
+        "pending": pending,
+        "live": [clean(e) | {"ttft_ms": round((e["first"] - e["t0"]) * 1000), "tok_s": round(rate(e), 1)}
                  for e in live],
-        "last": [{k: (round(v, 1) if isinstance(v, float) else v) for k, v in r.items()}
-                 for r in reversed(done)],
+        "last": [clean(r) for r in reversed(done)],
+        "decode": decode,
+        "prefill": [{k: r.get(k) for k in ("id", "start", "prompt_tokens", "cached", "new_tokens", "ttft_ms",
+                                           "prefill_tok_s", "prompt_est", "model")}
+                    for r in done if r.get("prefill_tok_s") is not None],
     }
 
 
+PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>llmproxy</title>
+<style>
+:root{--bg:#0e1116;--panel:#161b22;--line:#262d38;--text:#e6edf3;--dim:#8b96a5;--accent:#3fb950;--live:#f2b84b;
+--prefill:#58a6ff;--bad:#f85149;--grid:#222a35}
+@media (prefers-color-scheme:light){:root{--bg:#f4f6f8;--panel:#fff;--line:#d8dee6;--text:#1b2430;--dim:#5d6a7a;
+--accent:#1a7f37;--live:#b7791f;--prefill:#0969da;--bad:#cf222e;--grid:#e6ebf0}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:1180px;margin:0 auto;padding:20px 16px 40px}
+header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:16px}
+h1{font-size:18px;margin:0;font-weight:650;letter-spacing:.2px}
+.sub{color:var(--dim);font-size:12px}
+.chip{display:inline-flex;align-items:center;gap:7px;padding:3px 11px;border-radius:999px;border:1px solid var(--line);
+background:var(--panel);font-size:12px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--dim)}
+.chip.gen .dot{background:var(--live);animation:p 1s infinite}.chip.pre .dot{background:var(--prefill);animation:p .7s infinite}
+.chip.err .dot{background:var(--bad)}
+@keyframes p{50%{opacity:.25}}
+.spacer{flex:1}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.seg button{background:var(--panel);color:var(--dim);border:0;padding:4px 11px;font:inherit;font-size:12px;cursor:pointer}
+.seg button+button{border-left:1px solid var(--line)}
+.seg button.on{background:var(--accent);color:#fff}
+.hero{display:grid;grid-template-columns:minmax(220px,1.1fr) 3fr;gap:12px;margin-bottom:12px}
+@media (max-width:760px){.hero{grid-template-columns:1fr}}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+.big{font:600 56px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
+.big.live{color:var(--live)}
+.bigl{color:var(--dim);font-size:12px;margin-top:6px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px}
+.card{border-left:3px solid var(--line);padding:2px 0 2px 10px}
+.card b{display:block;font:600 20px/1.2 ui-monospace,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
+.card span{color:var(--dim);font-size:11.5px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+@media (max-width:900px){.grid2{grid-template-columns:1fr}}
+.panel h2{margin:0 0 2px;font-size:13px;font-weight:650}
+.panel .hint{color:var(--dim);font-size:11.5px;margin-bottom:8px}
+.chartwrap{position:relative;height:230px}
+canvas{width:100%;height:100%;display:block}
+.tip{position:absolute;pointer-events:none;background:var(--bg);border:1px solid var(--line);border-radius:8px;
+padding:5px 9px;font-size:12px;white-space:nowrap;display:none;z-index:2;box-shadow:0 4px 14px #0006}
+.empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--dim);font-size:12.5px}
+.legend{display:flex;gap:12px;flex-wrap:wrap;font-size:11.5px;color:var(--dim);margin-top:6px}
+.legend i{display:inline-block;width:10px;height:3px;border-radius:2px;margin-right:5px;vertical-align:middle}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{color:var(--dim);font-weight:500;text-align:right;padding:5px 8px;border-bottom:1px solid var(--line)}
+td{padding:5px 8px;text-align:right;font-variant-numeric:tabular-nums;border-bottom:1px solid var(--grid)}
+th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}
+td.m{max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+tr.l td{color:var(--live)}
+.tw{overflow-x:auto}
+footer{color:var(--dim);font-size:11.5px;margin-top:10px}
+</style></head><body><main>
+<header>
+ <h1>llmproxy</h1><span class="sub" id="target"></span>
+ <span class="chip" id="status"><span class="dot"></span><span id="stext">connecting</span></span>
+ <span class="spacer"></span>
+ <span class="sub">decode window</span>
+ <span class="seg" id="win"><button data-w="10">10 tok</button><button data-w="25">25 tok</button><button data-w="50">50 tok</button></span>
+</header>
+
+<section class="hero">
+ <div class="panel"><div class="big" id="big">-</div><div class="bigl" id="bigl">tok/s</div></div>
+ <div class="panel"><div class="cards" id="cards"></div></div>
+</section>
+
+<section class="grid2">
+ <div class="panel">
+  <h2>Inference (decode) speed</h2>
+  <div class="hint" id="dhint">tok/s over a sliding window of at least 10 tokens, against the output token position. Newest request is brightest.</div>
+  <div class="chartwrap"><canvas id="dc"></canvas><div class="empty" id="de">no generation measured yet</div><div class="tip" id="dt"></div></div>
+  <div class="legend" id="dl"></div>
+ </div>
+ <div class="panel">
+  <h2>Prefill speed</h2>
+  <div class="hint">new prompt tokens (cache hits left out) / time to first token, one bar per request.</div>
+  <div class="chartwrap"><canvas id="pc"></canvas><div class="empty" id="pe">no prefill measured yet</div><div class="tip" id="pt"></div></div>
+  <div class="legend"><span><i style="background:var(--prefill)"></i>measured prompt size</span>
+   <span><i style="background:var(--prefill);opacity:.4"></i>prompt size estimated (server sent no usage)</span></div>
+ </div>
+</section>
+
+<section class="panel">
+ <h2>Recent requests</h2>
+ <div class="tw"><table><thead><tr><th>time</th><th>model</th><th>prompt</th><th>cached</th><th>prefill tok/s</th>
+ <th>ttft</th><th>out tok</th><th>decode tok/s</th></tr></thead><tbody id="rows"></tbody></table></div>
+</section>
+<footer>Token counts come from the server's usage when it sends it. Speed is measured at the proxy.
+Non-streaming requests have no prefill/decode split. <a style="color:var(--dim)" href="/stats">/stats</a> has the raw numbers.</footer>
+</main>
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+let win=10;try{win=Math.max(10,+localStorage.getItem("llmproxy.win")||10)}catch(e){}
+let S=null;
+const fmt=(n,d=1)=>n==null?"-":(+n).toLocaleString(undefined,{maximumFractionDigits:d});
+const hms=t=>new Date(t*1000).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",second:"2-digit"});
+const dur=s=>s<90?s+" s":s<5400?Math.round(s/60)+" min":(s/3600).toFixed(1)+" h";
+const median=a=>{if(!a.length)return null;a=[...a].sort((x,y)=>x-y);return a[a.length>>1]};
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+for(const b of document.querySelectorAll("#win button")){
+  b.onclick=()=>{win=+b.dataset.w;try{localStorage.setItem("llmproxy.win",win)}catch(e){};mark();poll()};
+}
+function mark(){for(const b of document.querySelectorAll("#win button"))b.classList.toggle("on",+b.dataset.w===win);
+  $("dhint").textContent="tok/s over a sliding window of at least "+win+" tokens, against the output token position. Newest request is brightest."}
+
+function nice(max){if(max<=0)return 10;const p=10**Math.floor(Math.log10(max)),f=max/p;
+  return (f<=1?1:f<=2?2:f<=2.5?2.5:f<=5?5:10)*p}
+
+// ---- a small canvas chart: lines (decode) or bars (prefill) with hover read-out
+function Chart(canvas,tip,empty){
+  const c=canvas.getContext("2d");let model=null;
+  function size(){const r=canvas.getBoundingClientRect(),d=devicePixelRatio||1;
+    if(canvas.width!==Math.round(r.width*d)||canvas.height!==Math.round(r.height*d)){
+      canvas.width=Math.round(r.width*d);canvas.height=Math.round(r.height*d)}
+    c.setTransform(d,0,0,d,0,0);return[r.width,r.height]}
+  function draw(m,hover){
+    model=m;const[w,h]=size();c.clearRect(0,0,w,h);
+    const has=m&&m.items.length;empty.style.display=has?"none":"flex";if(!has)return;
+    const L=46,R=10,T=8,B=24,pw=w-L-R,ph=h-T-B;
+    const ymax=nice(m.ymax*1.08),xmin=m.xmin,xmax=m.xmax>m.xmin?m.xmax:m.xmin+1;
+    const X=x=>L+(x-xmin)/(xmax-xmin)*pw,Y=y=>T+ph-(y/ymax)*ph;
+    c.font="11px system-ui,sans-serif";c.textBaseline="middle";
+    c.strokeStyle=css("--grid");c.fillStyle=css("--dim");c.lineWidth=1;
+    for(let i=0;i<=4;i++){const v=ymax*i/4,y=Math.round(Y(v))+.5;
+      c.beginPath();c.moveTo(L,y);c.lineTo(w-R,y);c.stroke();c.textAlign="right";c.fillText(fmt(v,v<10?1:0),L-6,y)}
+    c.textAlign="center";c.textBaseline="top";
+    const nt=Math.max(2,Math.min(8,Math.floor(pw/90)));
+    for(let i=0;i<=nt;i++){const x=xmin+(xmax-xmin)*i/nt;c.fillText(m.xfmt(x),X(x),T+ph+6)}
+    m.draw(c,X,Y,{L,T,pw,ph,hover});
+  }
+  canvas.onmousemove=ev=>{if(!model)return;const r=canvas.getBoundingClientRect(),mx=ev.clientX-r.left,my=ev.clientY-r.top;
+    const hit=model.hit(mx,my,r.width,r.height);
+    if(!hit){tip.style.display="none";draw(model,null);return}
+    tip.innerHTML=hit.html;tip.style.display="block";
+    tip.style.left=Math.min(r.width-tip.offsetWidth-4,Math.max(4,hit.x+12))+"px";
+    tip.style.top=Math.max(2,hit.y-tip.offsetHeight-8)+"px";draw(model,hit)};
+  canvas.onmouseleave=()=>{tip.style.display="none";if(model)draw(model,null)};
+  return{draw,redraw:()=>model&&draw(model,null)};
+}
+const dchart=Chart($("dc"),$("dt"),$("de")),pchart=Chart($("pc"),$("pt"),$("pe"));
+
+function decodeModel(s){
+  const series=s.decode.filter(d=>d.points.length);
+  if(!series.length)return null;
+  let xmax=0,ymax=0;for(const d of series)for(const p of d.points){xmax=Math.max(xmax,p[0]);ymax=Math.max(ymax,p[1])}
+  const n=series.length;
+  const col=(d,i)=>d.live?css("--live"):css("--accent");
+  const alpha=i=>d=>d.live?1:0.28+0.72*((i+1)/n);
+  return{items:series,ymax,xmin:0,xmax,xfmt:x=>fmt(x,0),
+    draw(c,X,Y,g){
+      series.forEach((d,i)=>{c.globalAlpha=alpha(i)(d);c.strokeStyle=col(d,i);c.lineWidth=d.live?2.4:1.7;c.lineJoin="round";
+        c.beginPath();d.points.forEach((p,k)=>k?c.lineTo(X(p[0]),Y(p[1])):c.moveTo(X(p[0]),Y(p[1])));c.stroke();
+        if(d.live){const p=d.points[d.points.length-1];c.fillStyle=col(d,i);c.beginPath();c.arc(X(p[0]),Y(p[1]),3.5,0,7);c.fill()}});
+      c.globalAlpha=1;
+      if(g.hover){c.strokeStyle=css("--dim");c.setLineDash([3,3]);c.beginPath();c.moveTo(g.hover.px,g.T);c.lineTo(g.hover.px,g.T+g.ph);c.stroke();c.setLineDash([])}},
+    hit(mx,my,w,h){const L=46,R=10,T=8,B=24,pw=w-L-R,ph=h-T-B;
+      const ymax2=nice(ymax*1.08),x=(mx-L)/pw*(xmax||1);let best=null,bd=1e9;
+      for(const d of series)for(const p of d.points){const dd=Math.abs(p[0]-x)*pw/(xmax||1)+Math.abs(my-(T+ph-p[1]/ymax2*ph))*.35;
+        if(dd<bd){bd=dd;best={d,p}}}
+      if(!best||bd>40)return null;const{d,p}=best;
+      return{x:L+p[0]/(xmax||1)*pw,y:T+ph-p[1]/ymax2*ph,px:L+p[0]/(xmax||1)*pw,
+        html:"<b>"+fmt(p[1])+" tok/s</b><br>token "+fmt(p[0],0)+" of "+fmt(d.tokens,0)+"<br><span style='color:var(--dim)'>"+hms(d.start)+(d.live?" - live":"")+"</span>"}}};
+}
+function prefillModel(s){
+  const items=s.prefill.slice(-30);if(!items.length)return null;
+  const ymax=Math.max(...items.map(p=>p.prefill_tok_s)),n=items.length;
+  return{items,ymax,xmin:0,xmax:n,xfmt:x=>x>=0&&x<n&&items[Math.min(n-1,Math.floor(x))]?hms(items[Math.min(n-1,Math.floor(x))].start):"",
+    draw(c,X,Y,g){const bw=Math.max(2,g.pw/n*.7);
+      items.forEach((p,i)=>{const x=X(i+.5)-bw/2,y=Y(p.prefill_tok_s);
+        c.globalAlpha=p.prompt_est?.4:(g.hover&&g.hover.i===i?1:.85);c.fillStyle=css("--prefill");c.fillRect(x,y,bw,g.T+g.ph-y)});c.globalAlpha=1},
+    hit(mx,my,w,h){const L=46,R=10,T=8,B=24,pw=w-L-R,ph=h-T-B,i=Math.floor((mx-L)/pw*n);if(i<0||i>=n||my<T||my>T+ph)return null;
+      const p=items[i],ymax2=nice(ymax*1.08);
+      return{i,x:L+(i+.5)/n*pw,y:T+ph-p.prefill_tok_s/ymax2*ph,
+        html:"<b>"+fmt(p.prefill_tok_s,0)+" tok/s</b> prefill<br>"+fmt(p.new_tokens,0)+" new tokens"+(p.prompt_est?" (est.)":"")+
+        (p.cached?", "+fmt(p.cached,0)+" cached":"")+"<br>ttft "+fmt(p.ttft_ms,0)+" ms<br><span style='color:var(--dim)'>"+hms(p.start)+"</span>"}}};
+}
+
+function card(label,val,color){return"<div class='card'"+(color?" style='border-color:"+color+"'":"")+"><b>"+val+"</b><span>"+label+"</span></div>"}
+
+function render(s){
+  S=s;
+  const live=s.live[0],pend=s.pending[0];
+  const lv=s.decode.find(d=>d.live),lp=lv&&lv.points.length?lv.points[lv.points.length-1][1]:null;
+  const chip=$("status");chip.className="chip";
+  if(pend&&!live){chip.classList.add("pre");$("stext").textContent="prefill "+fmt(pend.elapsed_s,1)+" s"+(pend.prompt_guess?" (~"+fmt(pend.prompt_guess,0)+" tok)":"")}
+  else if(live){chip.classList.add("gen");$("stext").textContent="generating, "+fmt(live.tokens,0)+" tok"}
+  else $("stext").textContent="idle";
+  const big=$("big");
+  if(live){big.textContent=fmt(lp!=null?lp:live.tok_s);big.className="big live";$("bigl").textContent="tok/s now (last "+s.window+"+ tokens)"}
+  else{big.textContent=fmt(s.avg_tok_s);big.className="big";$("bigl").textContent="tok/s, average of last "+s.requests+" requests"}
+  const ttft=median(s.last.map(r=>r.ttft_ms).filter(x=>x>0)),pf=s.prefill.length?s.prefill[s.prefill.length-1].prefill_tok_s:null;
+  $("cards").innerHTML=card("peak, rolling "+s.window+" tok",fmt(s.peak_rolling_tok_s),css("--accent"))+
+    card("last prefill tok/s",fmt(pf,0),css("--prefill"))+card("median time to first token",ttft==null?"-":fmt(ttft,0)+" ms")+
+    card("requests since start",fmt(s.total_requests,0))+card("tokens since start",fmt(s.total_tokens,0))+card("uptime",dur(s.uptime_s));
+  dchart.draw(decodeModel(s),null);pchart.draw(prefillModel(s),null);
+  const lg=[];s.decode.forEach(d=>{});$("dl").innerHTML="<span><i style='background:var(--accent)'></i>finished request</span><span><i style='background:var(--live)'></i>live</span>";
+  const rows=[];
+  for(const e of s.live)rows.push("<tr class='l'><td>"+esc(hms(e.start))+"</td><td class='m'>"+esc(e.model)+"</td><td>"+fmt(e.prompt_tokens,0)+"</td><td>"+fmt(e.cached,0)+"</td><td>-</td><td>"+fmt(e.ttft_ms,0)+" ms</td><td>"+fmt(e.tokens,0)+"</td><td>"+(lp!=null?fmt(lp):fmt(e.tok_s))+" (live)</td></tr>");
+  for(const e of s.last.slice(0,15))rows.push("<tr><td>"+esc(e.start?hms(e.start):"")+"</td><td class='m' title='"+esc(e.path)+"'>"+esc(e.model||e.path)+"</td><td>"+(e.prompt_tokens!=null?(e.prompt_est?"~":"")+fmt(e.prompt_tokens,0):"-")+"</td><td>"+(e.cached?fmt(e.cached,0):"-")+"</td><td>"+fmt(e.prefill_tok_s,0)+"</td><td>"+(e.ttft_ms?fmt(e.ttft_ms,0)+" ms":"-")+"</td><td>"+fmt(e.tokens,0)+"</td><td>"+fmt(e.tok_s)+"</td></tr>");
+  $("rows").innerHTML=rows.join("")||"<tr><td colspan='8' style='text-align:center;color:var(--dim)'>no requests yet</td></tr>";
+}
+let busy=false;
+function poll(){if(busy||document.hidden)return;busy=true;
+  fetch("/stats?window="+win,{cache:"no-store"}).then(r=>r.json()).then(render).catch(()=>{
+    const chip=$("status");chip.className="chip err";$("stext").textContent="proxy unreachable"}).finally(()=>busy=false)}
+addEventListener("resize",()=>{dchart.redraw();pchart.redraw()});
+document.addEventListener("visibilitychange",poll);
+mark();$("target").textContent=location.host;poll();setInterval(poll,1000);
+</script></body></html>
+"""
+
+
 def page():
-    s = snapshot()
-    head = f"<meta http-equiv='refresh' content='1'><style>body{{background:#111;color:#0f0;font:14px/1.6 monospace}}.big{{font:42px monospace}}.l{{color:#ff0}}</style>"
-    big = s["live"][0]["tok_s"] if s["live"] else s["avg_tok_s"]
-    rows = lambda xs, cls: "".join(
-        f"<tr class='{cls}'><td>{x['path']}</td><td>{x['model']}</td><td>{x['tokens']} tok</td>"
-        f"<td>{x['tok_s']} tok/s</td><td>{x['ttft_ms']} ms ttft</td></tr>" for x in xs)
-    return (f"<html>{head}<body><h1>tok/sec</h1>"
-            f"<div class='big'>{big}</div>"
-            f"<h2>live</h2>{rows(s['live'], 'l')}"
-            f"<h2>last {len(s['last'])} of {s['requests']} requests, {s['tokens']} tok</h2>"
-            f"{rows(s['last'], 'd')}"
-            f"<p>avg {s['avg_tok_s']} tok/s (non-streaming tok/s includes prefill)</p></body></html>")
+    return PAGE
 
 
 # Harnesses swallow most leading "/" or "!" input, so the trigger is a plain word with a
@@ -219,10 +516,19 @@ class H(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def route(self):
-        if self.path.split("?")[0] in ("/", "/stats"):
-            body = (json.dumps(snapshot()) if self.path == "/stats" else page()).encode()
+        route, _, query = self.path.partition("?")
+        if route in ("/", "/stats"):
+            if route == "/stats":          # /stats?window=N: decode curve averaged over >= N tokens (min 10)
+                try:
+                    window = int(urllib.parse.parse_qs(query).get("window", [MIN_WINDOW])[0])
+                except ValueError:
+                    window = MIN_WINDOW
+                body = json.dumps(snapshot(window)).encode()
+            else:
+                body = page().encode()
             self.send_response(200)
-            self.send_header("Content-Type", "text/" + ("json" if self.path == "/stats" else "html"))
+            self.send_header("Content-Type", "text/json" if route == "/stats" else "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             return self.wfile.write(body)
@@ -245,11 +551,22 @@ class H(BaseHTTPRequestHandler):
         headers = {k: v for k, v in self.headers.items() if k.lower() not in DROP}
         req = urllib.request.Request(UPSTREAM + self.path, body or None, headers, method=self.command)
         t0 = time.time()
+        model = ""
+        try:
+            model = json.loads(body).get("model", "")
+        except Exception:
+            pass
+        key = next(KEY)
+        p_est = prompt_estimate(body) if self.command == "POST" else 0
+        if self.command == "POST" and "completion" in self.path:
+            PENDING[key] = {"id": key, "path": self.path, "model": model, "t0": t0, "prompt_guess": p_est,
+                            "first": None}      # shown as "prefill" on the dashboard until the first token
         try:
             resp = urllib.request.urlopen(req, timeout=600)
         except urllib.error.HTTPError as e:
             resp = e                      # pass upstream 4xx/5xx through untouched
         except Exception as e:
+            PENDING.pop(key, None)
             msg = f"proxy 502: upstream {UPSTREAM} unreachable: {e}".encode()
             self.send_response(502)
             self.send_header("Content-Length", str(len(msg)))
@@ -263,58 +580,76 @@ class H(BaseHTTPRequestHandler):
             if k.lower() not in DROP:
                 self.send_header(k, v)
 
-        model = ""
-        try:
-            model = json.loads(body).get("model", "")
-        except Exception:
-            pass
-
         if "event-stream" in ctype:
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
-            key = next(KEY)
-            e = LIVE[key] = {"path": self.path, "model": model, "tokens": 0,
-                             "t0": t0, "first": None, "last": None, "out": ""}
-            events = chars = usage = 0
-            while True:
-                line = resp.readline()
-                if not line:
-                    break
-                n, txt, u = sse(line)
-                events, chars = events + n, chars + len(txt)
-                usage = max(usage, u or 0)          # cumulative in llama.cpp
-                e["out"] += txt
-                if n:
-                    now = time.time()
-                    e["first"] = e["first"] or now
-                    e["last"] = now
-                e["tokens"] = usage or max(events, chars // 4)
-                self.chunk(line)
-            self.wfile.write(b"0\r\n\r\n")
-            e["secs"] = e["last"] - e["first"] if e["first"] else time.time() - t0
-            e["tok_s"] = round(rate(e), 1)
-            e["ttft_ms"] = round((e["first"] - t0) * 1000) if e["first"] else 0
-            record({k: v for k, v in e.items() if k not in ("t0", "out")})
-            dump(body, e, e["out"])
-            del LIVE[key]
+            e = LIVE[key] = {"id": key, "path": self.path, "model": model, "tokens": 0, "start": t0,
+                             "t0": t0, "first": None, "last": None, "out": "", "ev": [],
+                             "prompt_guess": p_est}
+            PENDING.pop(key, None)          # from here on LIVE carries it (a pending row until its first token)
+            events = chars = usage = cum = 0
+            try:
+                while True:
+                    line = resp.readline()
+                    if not line:
+                        break
+                    n, txt, u = sse(line)
+                    comp, prompt, cached = usage_numbers(u)
+                    events, chars = events + n, chars + len(txt)
+                    usage = max(usage, comp)                # cumulative in llama.cpp
+                    if prompt is not None:
+                        e["prompt_tokens"], e["cached"] = prompt, cached or 0
+                    e["out"] += txt
+                    if n:
+                        now = time.time()
+                        if e["first"] is None:
+                            e["first"] = now
+                            e["ev"].append((0.0, 0))        # the decode timeline starts at the first token
+                        e["last"] = now
+                        cum += event_tokens(txt)
+                        e["ev"].append((now - e["first"], cum))
+                    e["tokens"] = usage or max(events, chars // 4)
+                    self.chunk(line)
+                self.wfile.write(b"0\r\n\r\n")
+                e["secs"] = e["last"] - e["first"] if e["first"] else time.time() - t0
+                e["tok_s"] = round(rate(e), 1)
+                e["ttft_ms"] = round((e["first"] - t0) * 1000) if e["first"] else 0
+                e["scaled"] = bool(usage)             # the server's own count calibrates the per-event estimate
+                if "prompt_tokens" not in e and p_est:
+                    e["prompt_tokens"], e["cached"], e["prompt_est"] = p_est, 0, True
+                else:
+                    e["prompt_est"] = False
+                e["new_tokens"], e["prefill_tok_s"] = prefill_stats(e.get("prompt_tokens"), e.get("cached"), e["ttft_ms"])
+                record({k: v for k, v in e.items() if k not in ("t0", "out", "prompt_guess")})
+                dump(body, e, e["out"])
+            finally:
+                LIVE.pop(key, None)
         else:
-            data = resp.read()
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                data = resp.read()
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            finally:
+                PENDING.pop(key, None)
+            usage_j = None
             try:
                 j = json.loads(data)
                 out = ""
                 for c in j.get("choices", []):
                     m = c.get("message") or c
                     out += m.get("content") or m.get("reasoning_content") or m.get("text") or ""
-                tok = (j.get("usage") or {}).get("completion_tokens") or est(out)
+                usage_j = j.get("usage")
+                tok = (usage_j or {}).get("completion_tokens") or est(out)
             except Exception:
                 out, tok = "", 0
             secs = time.time() - t0
             if code == 200 and "/completion" in self.path:
-                entry = {"path": self.path, "model": model, "tokens": tok, "secs": secs,
-                         "tok_s": round(tok / secs, 1) if secs else 0.0, "ttft_ms": 0}
+                _, prompt, cached = usage_numbers(usage_j)
+                entry = {"id": key, "path": self.path, "model": model, "tokens": tok, "secs": secs, "start": t0,
+                         "tok_s": round(tok / secs, 1) if secs else 0.0, "ttft_ms": 0,
+                         "prompt_tokens": prompt if prompt is not None else (p_est or None),
+                         "cached": cached or 0, "prompt_est": prompt is None}
                 record(entry)
                 dump(body, entry, out)
 
@@ -329,10 +664,52 @@ def selftest():
                  b'data: {"usage":{"completion_tokens":2}}\n',
                  b'data: {"usage":{"completion_tokens":1}}\n'):
         n, txt, u = sse(line)
-        ev, ch, us = ev + n, ch + len(txt), max(us, u or 0)
+        ev, ch, us = ev + n, ch + len(txt), max(us, usage_numbers(u)[0])
     assert (ev, ch, us) == (2, 11, 2), (ev, ch, us)
     n, txt, u = sse(b'data: {"choices":[{"delta":{"content":"Hello"}}]}\n')
     assert (n, txt, u) == (1, "Hello", None)
+    # usage on the final chunk, next to an empty delta (Strata, llama.cpp): prompt, completion and cached tokens
+    n, txt, u = sse(b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":24,'
+                    b'"completion_tokens":38,"prompt_tokens_details":{"cached_tokens":10}}}\n')
+    assert (n, txt, usage_numbers(u)) == (0, "", (38, 24, 10)), (n, txt, u)
+    assert usage_numbers(None) == (0, None, None)
+    # prefill: only the tokens that were really read count, over the time to the first token
+    assert prefill_stats(1000, 0, 500) == (1000, 2000)
+    assert prefill_stats(1000, 900, 500) == (100, 200)
+    assert prefill_stats(50, 50, 500) == (0, None) and prefill_stats(None, None, 500) == (0, None)
+    assert prompt_estimate(json.dumps({"messages": [{"role": "user", "content": "x" * 400}]})) == 100
+    assert prompt_estimate(b"not json") == 0
+    # decode curve: 40 tokens at a steady 20 tok/s -> every point 20, windows of >= 10 tokens
+    steady = [(i / 20, i) for i in range(41)]
+    pts = curve(steady, 1.0, 10)
+    assert pts and pts[0][0] == 10 and all(abs(v - 20) < 0.2 for _, v in pts), pts[:3]
+    assert curve(steady[:9], 1.0, 10) == []                       # under 10 tokens: no point yet
+    assert curve(steady, 1.0, 1)[0][0] == 10                      # the window never drops below 10
+    burst = [(0.0, 0)] + [(0.5, k) for k in range(1, 7)] + [(1.0, k) for k in range(7, 13)]
+    assert all(v >= 10 for _, v in curve(burst, 1.0, 10)), curve(burst, 1.0, 10)   # a burst spreads over its window
+    assert len(curve([(i / 50, i) for i in range(2001)], 1.0, 10)) <= 201
+    assert curve(steady, 2.0, 10)[0][0] == 10 and abs(curve(steady, 2.0, 10)[0][1] - 40) < 0.5   # usage calibration
+    LIVE[99] = {"id": 99, "path": "/v1/chat/completions", "model": "m", "tokens": 12, "t0": time.time() - 3,
+                "start": time.time() - 3, "first": time.time() - 1, "last": time.time(), "out": "secret",
+                "ev": [(i / 12, i) for i in range(13)], "prompt_guess": 5}
+    PENDING[98] = {"id": 98, "path": "/v1/chat/completions", "model": "m", "t0": time.time() - 2,
+                   "prompt_guess": 7, "first": None}
+    snap = snapshot(25)
+    assert snap["window"] == 25 and snapshot(3)["window"] == 10
+    assert snap["pending"][0]["prompt_guess"] == 7 and snap["live"][0]["id"] == 99
+    assert "out" not in snap["live"][0] and "ev" not in snap["live"][0], snap["live"][0].keys()
+    assert snap["decode"][-1]["live"] and snap["decode"][-1]["points"] == []      # 12 tokens: under a 25-token window
+    json.dumps(snap)
+    LIVE.pop(99), PENDING.pop(98)
+    assert "<canvas" in page() and "/stats?window=" in page()
+    import re, shutil, subprocess, tempfile            # the dashboard script must parse (checked when node is installed)
+    node = shutil.which("node")
+    if node:
+        with tempfile.NamedTemporaryFile("w", suffix=".js") as f:
+            f.write(re.search(r"<script>(.*)</script>", page(), re.S).group(1))
+            f.flush()
+            r = subprocess.run([node, "--check", f.name], capture_output=True, text=True)
+            assert r.returncode == 0, r.stderr[:400]
     for content in ("/tps", "  %TPS\n", ";tps", "please ::tps now", [{"type": "text", "text": "/tokens"}]):
         body = json.dumps({"messages": [{"role": "user", "content": "hi"},
                                         {"role": "user", "content": content}]})
