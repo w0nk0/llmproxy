@@ -59,6 +59,7 @@ PENDING = {}                        # requests sent upstream, no response yet (p
 KEY = itertools.count()
 KEEP_EV = 8                         # finished requests that keep their per-token timeline (for the decode graph)
 MIN_WINDOW = 10                     # the decode graph averages over at least this many tokens
+MA_PERIOD = 20                      # samples in the moving average drawn over the decode curve
 
 
 def record(entry):
@@ -151,20 +152,26 @@ def prefill_stats(prompt, cached, ttft_ms):
 
 
 def curve(ev, scale=1.0, win=MIN_WINDOW, maxpts=200):
-    """Decode speed along one request: [(output token index, tok/s over the last >= win tokens)].
+    """Decode speed along one request: [(output token index, tok/s over the last >= win tokens, moving average)].
+
+    The moving average is the mean of the last MA_PERIOD of those samples (fewer at the start of a request).
 
     ev is [(seconds since the first token, tokens so far), ...]. A window always spans at least `win`
     tokens, so one slow or one bursty token (speculative drafts arrive together) does not spike the line.
     """
     win = max(MIN_WINDOW, int(win))
-    pts, j = [], 0
+    pts, j, recent, total = [], 0, collections.deque(), 0.0
     for i in range(1, len(ev)):
         t, c = ev[i][0], ev[i][1] * scale
         while j + 1 < i and c - ev[j + 1][1] * scale >= win:
             j += 1
         tj, cj = ev[j][0], ev[j][1] * scale
         if c - cj >= win and t > tj:
-            pts.append((round(c), round((c - cj) / (t - tj), 1)))
+            v = (c - cj) / (t - tj)
+            recent.append(v); total += v
+            if len(recent) > MA_PERIOD:
+                total -= recent.popleft()
+            pts.append((round(c), round(v, 1), round(total / len(recent), 1)))   # (token, rate, moving average)
     if len(pts) > maxpts:
         step = -(-len(pts) // maxpts)
         pts = pts[::step] + ([pts[-1]] if (len(pts) - 1) % step else [])
@@ -313,6 +320,7 @@ Non-streaming requests have no prefill/decode split. <a style="color:var(--dim)"
 "use strict";
 const $=id=>document.getElementById(id);
 const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const MA=20;
 let win=10;try{win=Math.max(10,+localStorage.getItem("llmproxy.win")||10)}catch(e){}
 let S=null;
 const fmt=(n,d=1)=>n==null?"-":(+n).toLocaleString(undefined,{maximumFractionDigits:d});
@@ -325,7 +333,7 @@ for(const b of document.querySelectorAll("#win button")){
   b.onclick=()=>{win=+b.dataset.w;try{localStorage.setItem("llmproxy.win",win)}catch(e){};mark();poll()};
 }
 function mark(){for(const b of document.querySelectorAll("#win button"))b.classList.toggle("on",+b.dataset.w===win);
-  $("dhint").textContent="tok/s over a sliding window of at least "+win+" tokens, against the output token position. Newest request is brightest."}
+  $("dhint").textContent="tok/s over a sliding window of at least "+win+" tokens, against the output token position, with a "+MA+"-sample moving average in front. Newest request is brightest."}
 
 function nice(max){if(max<=0)return 10;const p=10**Math.floor(Math.log10(max)),f=max/p;
   return (f<=1?1:f<=2?2:f<=2.5?2.5:f<=5?5:10)*p}
@@ -372,18 +380,21 @@ function decodeModel(s){
   const alpha=i=>d=>d.live?1:0.28+0.72*((i+1)/n);
   return{items:series,ymax,xmin:0,xmax,xfmt:x=>fmt(x,0),
     draw(c,X,Y,g){
-      series.forEach((d,i)=>{c.globalAlpha=alpha(i)(d);c.strokeStyle=col(d,i);c.lineWidth=d.live?2.4:1.7;c.lineJoin="round";
-        c.beginPath();d.points.forEach((p,k)=>k?c.lineTo(X(p[0]),Y(p[1])):c.moveTo(X(p[0]),Y(p[1])));c.stroke();
-        if(d.live){const p=d.points[d.points.length-1];c.fillStyle=col(d,i);c.beginPath();c.arc(X(p[0]),Y(p[1]),3.5,0,7);c.fill()}});
+      c.lineJoin="round";
+      series.forEach((d,i)=>{c.globalAlpha=alpha(i)(d)*0.3;c.strokeStyle=col(d,i);c.lineWidth=1;       // raw rate: dim, in the background
+        c.beginPath();d.points.forEach((p,k)=>k?c.lineTo(X(p[0]),Y(p[1])):c.moveTo(X(p[0]),Y(p[1])));c.stroke()});
+      series.forEach((d,i)=>{c.globalAlpha=alpha(i)(d);c.strokeStyle=col(d,i);c.lineWidth=d.live?2.6:2;  // moving average: bright, in front
+        c.beginPath();d.points.forEach((p,k)=>k?c.lineTo(X(p[0]),Y(p[2])):c.moveTo(X(p[0]),Y(p[2])));c.stroke();
+        if(d.live){const p=d.points[d.points.length-1];c.fillStyle=col(d,i);c.beginPath();c.arc(X(p[0]),Y(p[2]),3.5,0,7);c.fill()}});
       c.globalAlpha=1;
       if(g.hover){c.strokeStyle=css("--dim");c.setLineDash([3,3]);c.beginPath();c.moveTo(g.hover.px,g.T);c.lineTo(g.hover.px,g.T+g.ph);c.stroke();c.setLineDash([])}},
     hit(mx,my,w,h){const L=46,R=10,T=8,B=24,pw=w-L-R,ph=h-T-B;
       const ymax2=nice(ymax*1.08),x=(mx-L)/pw*(xmax||1);let best=null,bd=1e9;
-      for(const d of series)for(const p of d.points){const dd=Math.abs(p[0]-x)*pw/(xmax||1)+Math.abs(my-(T+ph-p[1]/ymax2*ph))*.35;
+      for(const d of series)for(const p of d.points){const dd=Math.abs(p[0]-x)*pw/(xmax||1)+Math.abs(my-(T+ph-p[2]/ymax2*ph))*.35;
         if(dd<bd){bd=dd;best={d,p}}}
       if(!best||bd>40)return null;const{d,p}=best;
-      return{x:L+p[0]/(xmax||1)*pw,y:T+ph-p[1]/ymax2*ph,px:L+p[0]/(xmax||1)*pw,
-        html:"<b>"+fmt(p[1])+" tok/s</b><br>token "+fmt(p[0],0)+" of "+fmt(d.tokens,0)+"<br><span style='color:var(--dim)'>"+hms(d.start)+(d.live?" - live":"")+"</span>"}}};
+      return{x:L+p[0]/(xmax||1)*pw,y:T+ph-p[2]/ymax2*ph,px:L+p[0]/(xmax||1)*pw,
+        html:"<b>"+fmt(p[2])+" tok/s</b> moving average ("+MA+")<br>"+fmt(p[1])+" tok/s raw<br>token "+fmt(p[0],0)+" of "+fmt(d.tokens,0)+"<br><span style='color:var(--dim)'>"+hms(d.start)+(d.live?" - live":"")+"</span>"}}};
 }
 function prefillModel(s){
   const items=s.prefill.slice(-30);if(!items.length)return null;
@@ -417,7 +428,7 @@ function render(s){
     card("last prefill tok/s",fmt(pf,0),css("--prefill"))+card("median time to first token",ttft==null?"-":fmt(ttft,0)+" ms")+
     card("requests since start",fmt(s.total_requests,0))+card("tokens since start",fmt(s.total_tokens,0))+card("uptime",dur(s.uptime_s));
   dchart.draw(decodeModel(s),null);pchart.draw(prefillModel(s),null);
-  const lg=[];s.decode.forEach(d=>{});$("dl").innerHTML="<span><i style='background:var(--accent)'></i>finished request</span><span><i style='background:var(--live)'></i>live</span>";
+  const lg=[];s.decode.forEach(d=>{});$("dl").innerHTML="<span><i style='background:var(--accent)'></i>finished request</span><span><i style='background:var(--live)'></i>live</span><span><i style='height:2px;background:var(--dim)'></i>"+MA+"-sample moving average (bright)</span><span><i style='height:1px;background:var(--dim);opacity:.5'></i>raw rate (dim)</span>";
   const rows=[];
   for(const e of s.live)rows.push("<tr class='l'><td>"+esc(hms(e.start))+"</td><td class='m'>"+esc(e.model)+"</td><td>"+fmt(e.prompt_tokens,0)+"</td><td>"+fmt(e.cached,0)+"</td><td>-</td><td>"+fmt(e.ttft_ms,0)+" ms</td><td>"+fmt(e.tokens,0)+"</td><td>"+(lp!=null?fmt(lp):fmt(e.tok_s))+" (live)</td></tr>");
   for(const e of s.last.slice(0,15))rows.push("<tr><td>"+esc(e.start?hms(e.start):"")+"</td><td class='m' title='"+esc(e.path)+"'>"+esc(e.model||e.path)+"</td><td>"+(e.prompt_tokens!=null?(e.prompt_est?"~":"")+fmt(e.prompt_tokens,0):"-")+"</td><td>"+(e.cached?fmt(e.cached,0):"-")+"</td><td>"+fmt(e.prefill_tok_s,0)+"</td><td>"+(e.ttft_ms?fmt(e.ttft_ms,0)+" ms":"-")+"</td><td>"+fmt(e.tokens,0)+"</td><td>"+fmt(e.tok_s)+"</td></tr>");
@@ -682,12 +693,18 @@ def selftest():
     # decode curve: 40 tokens at a steady 20 tok/s -> every point 20, windows of >= 10 tokens
     steady = [(i / 20, i) for i in range(41)]
     pts = curve(steady, 1.0, 10)
-    assert pts and pts[0][0] == 10 and all(abs(v - 20) < 0.2 for _, v in pts), pts[:3]
+    assert pts and pts[0][0] == 10 and all(abs(v - 20) < 0.2 and abs(m - 20) < 0.2 for _, v, m in pts), pts[:3]
     assert curve(steady[:9], 1.0, 10) == []                       # under 10 tokens: no point yet
     assert curve(steady, 1.0, 1)[0][0] == 10                      # the window never drops below 10
     burst = [(0.0, 0)] + [(0.5, k) for k in range(1, 7)] + [(1.0, k) for k in range(7, 13)]
-    assert all(v >= 10 for _, v in curve(burst, 1.0, 10)), curve(burst, 1.0, 10)   # a burst spreads over its window
+    assert all(v >= 10 for _, v, _m in curve(burst, 1.0, 10)), curve(burst, 1.0, 10)   # a burst spreads over its window
     assert len(curve([(i / 50, i) for i in range(2001)], 1.0, 10)) <= 201
+    ramp = [(i * i / 200, i) for i in range(1, 80)]                 # a slowing request: the average lags above the raw rate
+    rp = curve(ramp, 1.0, 10)
+    assert len(rp) > MA_PERIOD and rp[-1][2] > rp[-1][1] and rp[0][2] == rp[0][1], rp[:2]
+    one = [(i * 0.05, i) for i in range(30)] + [(1.5 + i * 0.5, 30 + i) for i in range(1, 30)]   # fast, then slow
+    op = curve(one, 1.0, 10)
+    assert abs(op[-1][2] - sum(p[1] for p in op[-MA_PERIOD:]) / MA_PERIOD) < 0.15, op[-1]   # mean of the last 20 samples
     assert curve(steady, 2.0, 10)[0][0] == 10 and abs(curve(steady, 2.0, 10)[0][1] - 40) < 0.5   # usage calibration
     LIVE[99] = {"id": 99, "path": "/v1/chat/completions", "model": "m", "tokens": 12, "t0": time.time() - 3,
                 "start": time.time() - 3, "first": time.time() - 1, "last": time.time(), "out": "secret",

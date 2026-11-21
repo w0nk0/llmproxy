@@ -42,7 +42,9 @@ Then point the client at `http://localhost:<port>` (e.g. `base_url="http://local
     running time and the prompt size) or **generating**;
   - **Inference (decode) speed** graph: tok/s over a sliding window of **at least 10 tokens** (buttons for
     25 and 50), against the output token position. One line per recent request (the last 8), the live one
-    in amber. The window is what keeps speculative-decoding bursts from spiking the line;
+    in amber. The window is what keeps speculative-decoding bursts from spiking the line. A bright
+    **20-sample moving average** is drawn over the dim raw rate, so the trend stays readable (`/stats` has
+    both: each point is `[token, rate, moving average]`);
   - **Prefill speed** graph: one bar per request, *new* prompt tokens (cache hits left out) ÷ time to first
     token. The prompt size is the server's own `usage.prompt_tokens` when it sends one; otherwise a
     chars/4 estimate, drawn fainter and marked with `~` in the table;
