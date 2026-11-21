@@ -296,7 +296,7 @@ footer{color:var(--dim);font-size:11.5px;margin-top:10px}
  <div class="panel">
   <h2>Inference (decode) speed</h2>
   <div class="hint" id="dhint">tok/s over a sliding window of at least 10 tokens, against the output token position. Newest request is brightest.</div>
-  <div class="chartwrap"><canvas id="dc"></canvas><div class="empty" id="de">no generation measured yet</div><div class="tip" id="dt"></div></div>
+  <div class="chartwrap"><canvas id="dc"></canvas><div class="empty" id="de">no request measured yet</div><div class="tip" id="dt"></div></div>
   <div class="legend" id="dl"></div>
  </div>
  <div class="panel">
@@ -333,10 +333,22 @@ for(const b of document.querySelectorAll("#win button")){
   b.onclick=()=>{win=+b.dataset.w;try{localStorage.setItem("llmproxy.win",win)}catch(e){};mark();poll()};
 }
 function mark(){for(const b of document.querySelectorAll("#win button"))b.classList.toggle("on",+b.dataset.w===win);
-  $("dhint").textContent="tok/s over a sliding window of at least "+win+" tokens, against the output token position, with a "+MA+"-sample moving average in front. Newest request is brightest."}
+  $("dhint").textContent="one band per request, oldest left, newest right. Decode: tok/s over a sliding window of at least "+win+" tokens against the output token position, with a "+MA+"-sample moving average in front (left scale, logarithmic above "+LOG_ABOVE+" tok/s). Blue bar: prefill tok/s (right scale)."}
 
 function nice(max){if(max<=0)return 10;const p=10**Math.floor(Math.log10(max)),f=max/p;
   return (f<=1?1:f<=2?2:f<=2.5?2.5:f<=5?5:10)*p}
+
+// left y scale: linear, but logarithmic (1 .. next power of 10) once the data exceeds LOG_ABOVE tok/s
+const LOG_ABOVE=1000;
+function yscale(max,T,ph,canLog){
+  if(canLog&&max>LOG_ABOVE){const top=10**Math.ceil(Math.log10(max*1.08)),dec=Math.log10(top),ticks=[];
+    for(let k=0;k<=dec;k++)ticks.push(10**k);
+    return{log:true,max:top,ticks,Y:y=>T+ph-Math.log10(Math.max(y,1))/dec*ph}}
+  const ymax=nice(max*1.08);
+  return{log:false,max:ymax,ticks:[0,1,2,3,4].map(i=>ymax*i/4),Y:y=>T+ph-(y/ymax)*ph}}
+
+// chart geometry: a second scale (m.ymax2) needs room for tick labels on the right too
+function pad(m){return{L:46,R:m.ymax2?46:10,T:8,B:24}}
 
 // ---- a small canvas chart: lines (decode) or bars (prefill) with hover read-out
 function Chart(canvas,tip,empty){
@@ -348,17 +360,21 @@ function Chart(canvas,tip,empty){
   function draw(m,hover){
     model=m;const[w,h]=size();c.clearRect(0,0,w,h);
     const has=m&&m.items.length;empty.style.display=has?"none":"flex";if(!has)return;
-    const L=46,R=10,T=8,B=24,pw=w-L-R,ph=h-T-B;
-    const ymax=nice(m.ymax*1.08),xmin=m.xmin,xmax=m.xmax>m.xmin?m.xmax:m.xmin+1;
-    const X=x=>L+(x-xmin)/(xmax-xmin)*pw,Y=y=>T+ph-(y/ymax)*ph;
+    const{L,R,T,B}=pad(m),pw=w-L-R,ph=h-T-B;
+    const ys=yscale(m.ymax,T,ph,m.canLog),ymax=ys.max,ymax2=m.ymax2?nice(m.ymax2*1.08):null;
+    const xmin=m.xmin,xmax=m.xmax>m.xmin?m.xmax:m.xmin+1;
+    const X=x=>L+(x-xmin)/(xmax-xmin)*pw,Y=ys.Y;
     c.font="11px system-ui,sans-serif";c.textBaseline="middle";
-    c.strokeStyle=css("--grid");c.fillStyle=css("--dim");c.lineWidth=1;
-    for(let i=0;i<=4;i++){const v=ymax*i/4,y=Math.round(Y(v))+.5;
-      c.beginPath();c.moveTo(L,y);c.lineTo(w-R,y);c.stroke();c.textAlign="right";c.fillText(fmt(v,v<10?1:0),L-6,y)}
-    c.textAlign="center";c.textBaseline="top";
+    c.strokeStyle=css("--grid");c.lineWidth=1;
+    ys.ticks.forEach(v=>{const y=Math.round(Y(v))+.5;
+      c.beginPath();c.moveTo(L,y);c.lineTo(w-R,y);c.stroke();
+      c.textAlign="right";c.fillStyle=css("--dim");c.fillText(fmt(v,ymax<10?1:0),L-6,y)});
+    if(ymax2)for(let i=0;i<=4;i++){const y=Math.round(T+ph-ph*i/4)+.5;
+      c.textAlign="left";c.fillStyle=css("--prefill");c.fillText(fmt(ymax2*i/4,ymax2<10?1:0),w-R+6,y)}
+    c.textAlign="center";c.textBaseline="top";c.fillStyle=css("--dim");
     const nt=Math.max(2,Math.min(8,Math.floor(pw/90)));
     for(let i=0;i<=nt;i++){const x=xmin+(xmax-xmin)*i/nt;c.fillText(m.xfmt(x),X(x),T+ph+6)}
-    m.draw(c,X,Y,{L,T,pw,ph,hover});
+    m.draw(c,X,Y,{L,T,pw,ph,hover,Y2:y=>ymax2?T+ph-(y/ymax2)*ph:Y(y)});
   }
   canvas.onmousemove=ev=>{if(!model)return;const r=canvas.getBoundingClientRect(),mx=ev.clientX-r.left,my=ev.clientY-r.top;
     const hit=model.hit(mx,my,r.width,r.height);
@@ -371,30 +387,49 @@ function Chart(canvas,tip,empty){
 }
 const dchart=Chart($("dc"),$("dt"),$("de")),pchart=Chart($("pc"),$("pt"),$("pe"));
 
+// one band per request, oldest on the left: decode curve on the left scale, prefill bar on the right scale
 function decodeModel(s){
-  const series=s.decode.filter(d=>d.points.length);
+  const series=s.decode.filter(d=>d.points.length).map((d,i)=>({d,i}));
   if(!series.length)return null;
-  let xmax=0,ymax=0;for(const d of series)for(const p of d.points){xmax=Math.max(xmax,p[0]);ymax=Math.max(ymax,p[1])}
+  const pf={};for(const p of s.prefill)pf[p.id]=p;
   const n=series.length;
-  const col=(d,i)=>d.live?css("--live"):css("--accent");
+  let ymax=0,ymax2=0;
+  for(const{d}of series)for(const p of d.points)ymax=Math.max(ymax,p[2]);   // scale on the moving average: a bursty raw sample stays off it
+  for(const{d}of series){const q=pf[d.id];if(q)ymax2=Math.max(ymax2,q.prefill_tok_s)}
+  const col=d=>d.live?css("--live"):css("--accent");
   const alpha=i=>d=>d.live?1:0.28+0.72*((i+1)/n);
-  return{items:series,ymax,xmin:0,xmax,xfmt:x=>fmt(x,0),
+  const bx=(i,d,p)=>i+(d.tokens?Math.min(1,p[0]/d.tokens):0);   // output token position inside the request's band
+  const barw=pw=>Math.max(3,pw/n*.16);
+  return{items:series.map(x=>x.d),ymax,ymax2:ymax2||null,canLog:true,xmin:0,xmax:n,
+    xfmt:x=>{const d=series[Math.min(n-1,Math.max(0,Math.floor(x)))];return d?hms(d.d.start):""},
     draw(c,X,Y,g){
-      c.lineJoin="round";
-      series.forEach((d,i)=>{c.globalAlpha=Math.max(0.2,alpha(i)(d)*0.5);c.strokeStyle=col(d,i);c.lineWidth=1.3;   // raw rate: dim, in the background
-        c.beginPath();d.points.forEach((p,k)=>k?c.lineTo(X(p[0]),Y(p[1])):c.moveTo(X(p[0]),Y(p[1])));c.stroke()});
-      series.forEach((d,i)=>{c.globalAlpha=alpha(i)(d);c.strokeStyle=col(d,i);c.lineWidth=d.live?2.6:2;  // moving average: bright, in front
-        c.beginPath();d.points.forEach((p,k)=>k?c.lineTo(X(p[0]),Y(p[2])):c.moveTo(X(p[0]),Y(p[2])));c.stroke();
-        if(d.live){const p=d.points[d.points.length-1];c.fillStyle=col(d,i);c.beginPath();c.arc(X(p[0]),Y(p[2]),3.5,0,7);c.fill()}});
+      c.lineJoin="round";const bw=barw(g.pw);
+      series.forEach(({d,i})=>{const q=pf[d.id];if(!q)return;                     // prefill, own scale, at the start of the band
+        c.globalAlpha=.55;c.fillStyle=css("--prefill");const y=g.Y2(q.prefill_tok_s);c.fillRect(X(i+.05),y,bw,g.T+g.ph-y)});
+      c.globalAlpha=1;
+      series.forEach(({d,i})=>{c.globalAlpha=Math.max(0.2,alpha(i)(d)*0.5);c.strokeStyle=col(d);c.lineWidth=1.3;   // raw rate: dim, cut off at the top
+        c.beginPath();d.points.forEach((p,k)=>k?c.lineTo(X(bx(i,d,p)),Y(p[1])):c.moveTo(X(bx(i,d,p)),Y(p[1])));c.stroke()});
+      series.forEach(({d,i})=>{c.globalAlpha=alpha(i)(d);c.strokeStyle=col(d);c.lineWidth=d.live?2.6:2;  // moving average: bright, in front
+        c.beginPath();d.points.forEach((p,k)=>k?c.lineTo(X(bx(i,d,p)),Y(p[2])):c.moveTo(X(bx(i,d,p)),Y(p[2])));c.stroke();
+        if(d.live){const p=d.points[d.points.length-1];c.fillStyle=col(d);c.beginPath();c.arc(X(bx(i,d,p)),Y(p[2]),3.5,0,7);c.fill()}});
       c.globalAlpha=1;
       if(g.hover){c.strokeStyle=css("--dim");c.setLineDash([3,3]);c.beginPath();c.moveTo(g.hover.px,g.T);c.lineTo(g.hover.px,g.T+g.ph);c.stroke();c.setLineDash([])}},
-    hit(mx,my,w,h){const L=46,R=10,T=8,B=24,pw=w-L-R,ph=h-T-B;
-      const ymax2=nice(ymax*1.08),x=(mx-L)/pw*(xmax||1);let best=null,bd=1e9;
-      for(const d of series)for(const p of d.points){const dd=Math.abs(p[0]-x)*pw/(xmax||1)+Math.abs(my-(T+ph-p[2]/ymax2*ph))*.35;
-        if(dd<bd){bd=dd;best={d,p}}}
-      if(!best||bd>40)return null;const{d,p}=best;
-      return{x:L+p[0]/(xmax||1)*pw,y:T+ph-p[2]/ymax2*ph,px:L+p[0]/(xmax||1)*pw,
-        html:"<b>"+fmt(p[2])+" tok/s</b> moving average ("+MA+")<br>"+fmt(p[1])+" tok/s raw<br>token "+fmt(p[0],0)+" of "+fmt(d.tokens,0)+"<br><span style='color:var(--dim)'>"+hms(d.start)+(d.live?" - live":"")+"</span>"}}};
+    hit(mx,my,w,h){const{L,R,T,B}=pad({ymax2}),pw=w-L-R,ph=h-T-B;
+      if(my<T||my>T+ph)return null;
+      const X=x=>L+x/n*pw,Y=yscale(ymax,T,ph,true).Y,bw=barw(pw);
+      const Y2=v=>ymax2?T+ph-v/nice(ymax2*1.08)*ph:null;
+      for(const{i,d}of series){const q=pf[d.id],x0=X(i+.05);          // the bar is narrow: read it before the lines
+        if(q&&mx>=x0-2&&mx<=x0+bw+2&&my>=Y2(q.prefill_tok_s)-2)
+          return{x:x0+bw/2,y:Y2(q.prefill_tok_s),
+            html:"<b>"+fmt(q.prefill_tok_s,0)+" tok/s</b> prefill (right scale)<br>"+fmt(q.new_tokens,0)+" new tokens"+(q.prompt_est?" (est.)":"")+
+            (q.cached?", "+fmt(q.cached,0)+" cached":"")+"<br>ttft "+fmt(q.ttft_ms,0)+" ms<br><span style='color:var(--dim)'>"+hms(q.start)+"</span>"}}
+      let best=null,bd=1e9;
+      for(const{d,i}of series)for(const p of d.points){const px=X(bx(i,d,p)),dd=Math.abs(mx-px)+Math.abs(my-Y(p[2]))*.35;
+        if(dd<bd){bd=dd;best={d,p,px}}}
+      if(!best||bd>40)return null;const{d,p,px}=best;
+      return{x:px,y:Y(p[2]),px,
+        html:"<b>"+fmt(p[2])+" tok/s</b> decode (left scale)<br>"+fmt(p[1])+" tok/s raw<br>token "+fmt(p[0],0)+" of "+fmt(d.tokens,0)+
+        "<br><span style='color:var(--dim)'>"+hms(d.start)+(d.live?" - live":"")+"</span>"}}};
 }
 function prefillModel(s){
   const items=s.prefill.slice(-30);if(!items.length)return null;
@@ -403,7 +438,7 @@ function prefillModel(s){
     draw(c,X,Y,g){const bw=Math.max(2,g.pw/n*.7);
       items.forEach((p,i)=>{const x=X(i+.5)-bw/2,y=Y(p.prefill_tok_s);
         c.globalAlpha=p.prompt_est?.4:(g.hover&&g.hover.i===i?1:.85);c.fillStyle=css("--prefill");c.fillRect(x,y,bw,g.T+g.ph-y)});c.globalAlpha=1},
-    hit(mx,my,w,h){const L=46,R=10,T=8,B=24,pw=w-L-R,ph=h-T-B,i=Math.floor((mx-L)/pw*n);if(i<0||i>=n||my<T||my>T+ph)return null;
+    hit(mx,my,w,h){const{L,R,T,B}=pad({}),pw=w-L-R,ph=h-T-B,i=Math.floor((mx-L)/pw*n);if(i<0||i>=n||my<T||my>T+ph)return null;
       const p=items[i],ymax2=nice(ymax*1.08);
       return{i,x:L+(i+.5)/n*pw,y:T+ph-p.prefill_tok_s/ymax2*ph,
         html:"<b>"+fmt(p.prefill_tok_s,0)+" tok/s</b> prefill<br>"+fmt(p.new_tokens,0)+" new tokens"+(p.prompt_est?" (est.)":"")+
@@ -428,7 +463,7 @@ function render(s){
     card("last prefill tok/s",fmt(pf,0),css("--prefill"))+card("median time to first token",ttft==null?"-":fmt(ttft,0)+" ms")+
     card("requests since start",fmt(s.total_requests,0))+card("tokens since start",fmt(s.total_tokens,0))+card("uptime",dur(s.uptime_s));
   dchart.draw(decodeModel(s),null);pchart.draw(prefillModel(s),null);
-  const lg=[];s.decode.forEach(d=>{});$("dl").innerHTML="<span><i style='background:var(--accent)'></i>finished request</span><span><i style='background:var(--live)'></i>live</span><span><i style='height:2px;background:var(--dim)'></i>"+MA+"-sample moving average (bright)</span><span><i style='height:1px;background:var(--dim);opacity:.5'></i>raw rate (dim)</span>";
+  $("dl").innerHTML="<span><i style='background:var(--accent)'></i>finished request</span><span><i style='background:var(--live)'></i>live</span><span><i style='height:2px;background:var(--dim)'></i>"+MA+"-sample moving average (bright)</span><span><i style='height:1px;background:var(--dim);opacity:.5'></i>raw rate (dim, cut off at the top)</span><span><i style='background:var(--prefill);height:8px;opacity:.55'></i>prefill tok/s (right scale)</span>";
   const rows=[];
   for(const e of s.live)rows.push("<tr class='l'><td>"+esc(hms(e.start))+"</td><td class='m'>"+esc(e.model)+"</td><td>"+fmt(e.prompt_tokens,0)+"</td><td>"+fmt(e.cached,0)+"</td><td>-</td><td>"+fmt(e.ttft_ms,0)+" ms</td><td>"+fmt(e.tokens,0)+"</td><td>"+(lp!=null?fmt(lp):fmt(e.tok_s))+" (live)</td></tr>");
   for(const e of s.last.slice(0,15))rows.push("<tr><td>"+esc(e.start?hms(e.start):"")+"</td><td class='m' title='"+esc(e.path)+"'>"+esc(e.model||e.path)+"</td><td>"+(e.prompt_tokens!=null?(e.prompt_est?"~":"")+fmt(e.prompt_tokens,0):"-")+"</td><td>"+(e.cached?fmt(e.cached,0):"-")+"</td><td>"+fmt(e.prefill_tok_s,0)+"</td><td>"+(e.ttft_ms?fmt(e.ttft_ms,0)+" ms":"-")+"</td><td>"+fmt(e.tokens,0)+"</td><td>"+fmt(e.tok_s)+"</td></tr>");
@@ -440,7 +475,7 @@ function poll(){if(busy||document.hidden)return;busy=true;
     const chip=$("status");chip.className="chip err";$("stext").textContent="proxy unreachable"}).finally(()=>busy=false)}
 addEventListener("resize",()=>{dchart.redraw();pchart.redraw()});
 document.addEventListener("visibilitychange",poll);
-mark();$("target").textContent=location.host;$("ver").textContent="page v3 (moving average + dim raw line) -";poll();setInterval(poll,1000);
+mark();$("target").textContent=location.host;$("ver").textContent="page v5 (decode left scale goes logarithmic above 1000 tok/s) -";poll();setInterval(poll,1000);
 </script></body></html>
 """
 
@@ -719,14 +754,51 @@ def selftest():
     json.dumps(snap)
     LIVE.pop(99), PENDING.pop(98)
     assert "<canvas" in page() and "/stats?window=" in page()
-    import re, shutil, subprocess, tempfile            # the dashboard script must parse (checked when node is installed)
+    import re, shutil, subprocess, tempfile            # the dashboard script must parse and run (checked when node is installed)
     node = shutil.which("node")
     if node:
+        harness = """\
+globalThis.devicePixelRatio=1;globalThis.location={host:"x"};globalThis.setInterval=()=>{};
+globalThis.localStorage={getItem:()=>null,setItem(){}};globalThis.addEventListener=()=>{};
+globalThis.fetch=()=>{const o={then:()=>o,catch:()=>o,finally:()=>o};return o};
+globalThis.getComputedStyle=()=>({getPropertyValue:()=>"#fff"});
+globalThis.calls=[];
+const stubctx=()=>new Proxy({},{get:(t,k)=>(...a)=>{calls.push(k);return 0},set:()=>true});
+const stubel=()=>({style:{},dataset:{},classList:{toggle(){},add(){}},textContent:"",innerHTML:"",
+                   getContext:stubctx,getBoundingClientRect:()=>({width:420,height:230}),offsetWidth:100,offsetHeight:20});
+const stubels={};globalThis.document={documentElement:{},getElementById:id=>stubels[id]||(stubels[id]=stubel()),
+                querySelectorAll:()=>[],addEventListener(){}};
+"""
+        demo = {"requests": 2, "tokens": 300, "avg_tok_s": 30.0, "window": 10, "uptime_s": 100,
+                "total_requests": 2, "total_tokens": 300, "peak_request_tok_s": 40.0, "peak_rolling_tok_s": 600.0,
+                "pending": [], "live": [], "last": [],
+                "decode": [{"id": 1, "live": False, "start": 1700000000, "model": "m", "tokens": 20,
+                            "points": [[5, 600.0, 30.0], [10, 500.0, 32.0], [20, 400.0, 34.0]]},
+                           {"id": 2, "live": True, "start": 1700000001, "model": "m", "tokens": 12,
+                            "points": [[10, 200.0, 25.0]]}],
+                "prefill": [{"id": 1, "start": 1700000000, "prompt_tokens": 9000, "cached": 0, "new_tokens": 9000,
+                             "ttft_ms": 900, "prefill_tok_s": 10000, "prompt_est": False, "model": "m"}]}
+        check = """\
+const m=decodeModel(DEMO);
+if(m.ymax!==34)throw new Error("left scale must follow the moving average, not the raw spikes: "+m.ymax);
+if(m.ymax2!==10000)throw new Error("prefill must keep its own right scale: "+m.ymax2);
+dchart.draw(m,null);
+if(!calls.includes("fillRect"))throw new Error("no prefill bar drawn");
+const hm=decodeModel(DEMO),bar=hm.hit(60,107,420,230),line=hm.hit(128,79,420,230);
+if(!bar||!bar.html.includes("right scale"))throw new Error("prefill bar hover: "+JSON.stringify(bar));
+if(!line||!line.html.includes("left scale"))throw new Error("decode line hover: "+JSON.stringify(line));
+const lin=yscale(900,0,100,true),lg=yscale(5000,0,100,true);
+if(lin.log||lg.log!==true)throw new Error("log scale only above "+LOG_ABOVE+" tok/s");
+if(lg.ticks.join()!=="1,10,100,1000,10000"||lg.Y(1)!==100||lg.Y(10000)!==0||lg.Y(0)!==100||Math.abs(lg.Y(100)-50)>1e-9)
+  throw new Error("log scale geometry: "+lg.ticks+" "+lg.Y(100));
+if(yscale(5000,0,100,false).log)throw new Error("prefill chart stays linear");
+"""
         with tempfile.NamedTemporaryFile("w", suffix=".js") as f:
-            f.write(re.search(r"<script>(.*)</script>", page(), re.S).group(1))
+            f.write(harness + re.search(r"<script>(.*)</script>", page(), re.S).group(1)
+                    + check.replace("DEMO", json.dumps(demo)))
             f.flush()
-            r = subprocess.run([node, "--check", f.name], capture_output=True, text=True)
-            assert r.returncode == 0, r.stderr[:400]
+            r = subprocess.run([node, f.name], capture_output=True, text=True)
+            assert r.returncode == 0, (r.stdout + r.stderr)[:600]
     for content in ("/tps", "  %TPS\n", ";tps", "please ::tps now", [{"type": "text", "text": "/tokens"}]):
         body = json.dumps({"messages": [{"role": "user", "content": "hi"},
                                         {"role": "user", "content": content}]})

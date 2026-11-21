@@ -41,10 +41,13 @@ Then point the client at `http://localhost:<port>` (e.g. `base_url="http://local
     or the average of the last requests when idle; a status chip shows **idle**, **prefill** (with the
     running time and the prompt size) or **generating**;
   - **Inference (decode) speed** graph: tok/s over a sliding window of **at least 10 tokens** (buttons for
-    25 and 50), against the output token position. One line per recent request (the last 8), the live one
-    in amber. The window is what keeps speculative-decoding bursts from spiking the line. A bright
+    25 and 50), against the output token position. One band per recent request (the last 8, oldest left),
+    the live one in amber, with that request's prefill tok/s as a blue bar on its own right-hand scale.
+    The window is what keeps speculative-decoding bursts from spiking the line. A bright
     **20-sample moving average** is drawn over the dim raw rate, so the trend stays readable (`/stats` has
-    both: each point is `[token, rate, moving average]`);
+    both: each point is `[token, rate, moving average]`). The left scale follows the moving average and
+    turns **logarithmic** (1, 10, 100, 1000, ...) once it goes above 1000 tok/s, so one spike can't
+    flatten everything else;
   - **Prefill speed** graph: one bar per request, *new* prompt tokens (cache hits left out) ÷ time to first
     token. The prompt size is the server's own `usage.prompt_tokens` when it sends one; otherwise a
     chars/4 estimate, drawn fainter and marked with `~` in the table;
