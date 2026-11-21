@@ -313,7 +313,7 @@ footer{color:var(--dim);font-size:11.5px;margin-top:10px}
  <div class="tw"><table><thead><tr><th>time</th><th>model</th><th>prompt</th><th>cached</th><th>prefill tok/s</th>
  <th>ttft</th><th>out tok</th><th>decode tok/s</th></tr></thead><tbody id="rows"></tbody></table></div>
 </section>
-<footer>Token counts come from the server's usage when it sends it. Speed is measured at the proxy.
+<footer><span id="ver"></span> Token counts come from the server's usage when it sends it. Speed is measured at the proxy.
 Non-streaming requests have no prefill/decode split. <a style="color:var(--dim)" href="/stats">/stats</a> has the raw numbers.</footer>
 </main>
 <script>
@@ -381,7 +381,7 @@ function decodeModel(s){
   return{items:series,ymax,xmin:0,xmax,xfmt:x=>fmt(x,0),
     draw(c,X,Y,g){
       c.lineJoin="round";
-      series.forEach((d,i)=>{c.globalAlpha=alpha(i)(d)*0.3;c.strokeStyle=col(d,i);c.lineWidth=1;       // raw rate: dim, in the background
+      series.forEach((d,i)=>{c.globalAlpha=Math.max(0.2,alpha(i)(d)*0.5);c.strokeStyle=col(d,i);c.lineWidth=1.3;   // raw rate: dim, in the background
         c.beginPath();d.points.forEach((p,k)=>k?c.lineTo(X(p[0]),Y(p[1])):c.moveTo(X(p[0]),Y(p[1])));c.stroke()});
       series.forEach((d,i)=>{c.globalAlpha=alpha(i)(d);c.strokeStyle=col(d,i);c.lineWidth=d.live?2.6:2;  // moving average: bright, in front
         c.beginPath();d.points.forEach((p,k)=>k?c.lineTo(X(p[0]),Y(p[2])):c.moveTo(X(p[0]),Y(p[2])));c.stroke();
@@ -440,7 +440,7 @@ function poll(){if(busy||document.hidden)return;busy=true;
     const chip=$("status");chip.className="chip err";$("stext").textContent="proxy unreachable"}).finally(()=>busy=false)}
 addEventListener("resize",()=>{dchart.redraw();pchart.redraw()});
 document.addEventListener("visibilitychange",poll);
-mark();$("target").textContent=location.host;poll();setInterval(poll,1000);
+mark();$("target").textContent=location.host;$("ver").textContent="page v3 (moving average + dim raw line) -";poll();setInterval(poll,1000);
 </script></body></html>
 """
 
