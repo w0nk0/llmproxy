@@ -85,7 +85,8 @@ def dump(prompt, entry, out):
                                 "tok_s": entry["tok_s"], "ttft_ms": entry["ttft_ms"],
                                 "prompt_tokens": entry.get("prompt_tokens"),
                                 "cached_tokens": entry.get("cached"),
-                                "prefill_tok_s": entry.get("prefill_tok_s")},
+                                "prefill_tok_s": entry.get("prefill_tok_s"),
+                                "effective_tok_s": entry.get("effective_tok_s")},
                                ensure_ascii=False) + "\n")
     except OSError as e:
         print(f"proxy: cannot write {LOGFILE}: {e}")
@@ -145,10 +146,20 @@ def rate(e):
     return e["tokens"] / (e["last"] - e["first"]) if e["first"] and e["last"] > e["first"] else 0.0
 
 
+MIN_PREFILL_NEW = 128   # below this many uncached tokens the time to first token is fixed overhead, not reading speed
+
+
 def prefill_stats(prompt, cached, ttft_ms):
-    """-> (new prompt tokens, prefill tok/s or None): what was really read this turn / time to first token."""
+    """-> (new prompt tokens, prefill tok/s or None, effective tok/s or None).
+
+    prefill tok/s = uncached prompt tokens / time to first token: how fast the server reads. None when fewer than
+    MIN_PREFILL_NEW tokens were new (a cache hit: the rate would only measure overhead, e.g. 1 token / 117 ms = 9 tok/s).
+    effective tok/s = all prompt tokens / time to first token: the speed a user feels, cache included."""
     new = max(0, (prompt or 0) - (cached or 0))
-    return new, (round(new / (ttft_ms / 1000)) if new >= 1 and ttft_ms > 0 else None)
+    sec = ttft_ms / 1000 if ttft_ms and ttft_ms > 0 else 0
+    pre = round(new / sec) if sec and new >= MIN_PREFILL_NEW else None
+    eff = round(prompt / sec) if sec and prompt else None
+    return new, pre, eff
 
 
 def curve(ev, scale=1.0, win=MIN_WINDOW, maxpts=200):
@@ -218,7 +229,7 @@ def snapshot(window=MIN_WINDOW):
         "last": [clean(r) for r in reversed(done)],
         "decode": decode,
         "prefill": [{k: r.get(k) for k in ("id", "start", "prompt_tokens", "cached", "new_tokens", "ttft_ms",
-                                           "prefill_tok_s", "prompt_est", "model")}
+                                           "prefill_tok_s", "effective_tok_s", "prompt_est", "model")}
                     for r in done if r.get("prefill_tok_s") is not None],
     }
 
@@ -301,7 +312,7 @@ footer{color:var(--dim);font-size:11.5px;margin-top:10px}
  </div>
  <div class="panel">
   <h2>Prefill speed</h2>
-  <div class="hint">new prompt tokens (cache hits left out) / time to first token, one bar per request.</div>
+  <div class="hint">uncached prompt tokens / time to first token, one bar per request. Requests with fewer than 128 uncached tokens (cache hits) are left out: their time to first token is overhead, not reading speed. Hover shows the effective rate over all prompt tokens.</div>
   <div class="chartwrap"><canvas id="pc"></canvas><div class="empty" id="pe">no prefill measured yet</div><div class="tip" id="pt"></div></div>
   <div class="legend"><span><i style="background:var(--prefill)"></i>measured prompt size</span>
    <span><i style="background:var(--prefill);opacity:.4"></i>prompt size estimated (server sent no usage)</span></div>
@@ -422,7 +433,7 @@ function decodeModel(s){
         if(q&&mx>=x0-2&&mx<=x0+bw+2&&my>=Y2(q.prefill_tok_s)-2)
           return{x:x0+bw/2,y:Y2(q.prefill_tok_s),
             html:"<b>"+fmt(q.prefill_tok_s,0)+" tok/s</b> prefill (right scale)<br>"+fmt(q.new_tokens,0)+" new tokens"+(q.prompt_est?" (est.)":"")+
-            (q.cached?", "+fmt(q.cached,0)+" cached":"")+"<br>ttft "+fmt(q.ttft_ms,0)+" ms<br><span style='color:var(--dim)'>"+hms(q.start)+"</span>"}}
+            (q.cached?", "+fmt(q.cached,0)+" cached":"")+(q.effective_tok_s?"<br>"+fmt(q.effective_tok_s,0)+" tok/s effective (all prompt tokens)":"")+"<br>ttft "+fmt(q.ttft_ms,0)+" ms<br><span style='color:var(--dim)'>"+hms(q.start)+"</span>"}}
       let best=null,bd=1e9;
       for(const{d,i}of series)for(const p of d.points){const px=X(bx(i,d,p)),dd=Math.abs(mx-px)+Math.abs(my-Y(p[2]))*.35;
         if(dd<bd){bd=dd;best={d,p,px}}}
@@ -442,7 +453,7 @@ function prefillModel(s){
       const p=items[i],ymax2=nice(ymax*1.08);
       return{i,x:L+(i+.5)/n*pw,y:T+ph-p.prefill_tok_s/ymax2*ph,
         html:"<b>"+fmt(p.prefill_tok_s,0)+" tok/s</b> prefill<br>"+fmt(p.new_tokens,0)+" new tokens"+(p.prompt_est?" (est.)":"")+
-        (p.cached?", "+fmt(p.cached,0)+" cached":"")+"<br>ttft "+fmt(p.ttft_ms,0)+" ms<br><span style='color:var(--dim)'>"+hms(p.start)+"</span>"}}};
+        (p.cached?", "+fmt(p.cached,0)+" cached":"")+(p.effective_tok_s?"<br>"+fmt(p.effective_tok_s,0)+" tok/s effective (all prompt tokens)":"")+"<br>ttft "+fmt(p.ttft_ms,0)+" ms<br><span style='color:var(--dim)'>"+hms(p.start)+"</span>"}}};
 }
 
 function card(label,val,color){return"<div class='card'"+(color?" style='border-color:"+color+"'":"")+"><b>"+val+"</b><span>"+label+"</span></div>"}
@@ -466,7 +477,7 @@ function render(s){
   $("dl").innerHTML="<span><i style='background:var(--accent)'></i>finished request</span><span><i style='background:var(--live)'></i>live</span><span><i style='height:2px;background:var(--dim)'></i>"+MA+"-sample moving average (bright)</span><span><i style='height:1px;background:var(--dim);opacity:.5'></i>raw rate (dim, cut off at the top)</span><span><i style='background:var(--prefill);height:8px;opacity:.55'></i>prefill tok/s (right scale)</span>";
   const rows=[];
   for(const e of s.live)rows.push("<tr class='l'><td>"+esc(hms(e.start))+"</td><td class='m'>"+esc(e.model)+"</td><td>"+fmt(e.prompt_tokens,0)+"</td><td>"+fmt(e.cached,0)+"</td><td>-</td><td>"+fmt(e.ttft_ms,0)+" ms</td><td>"+fmt(e.tokens,0)+"</td><td>"+(lp!=null?fmt(lp):fmt(e.tok_s))+" (live)</td></tr>");
-  for(const e of s.last.slice(0,15))rows.push("<tr><td>"+esc(e.start?hms(e.start):"")+"</td><td class='m' title='"+esc(e.path)+"'>"+esc(e.model||e.path)+"</td><td>"+(e.prompt_tokens!=null?(e.prompt_est?"~":"")+fmt(e.prompt_tokens,0):"-")+"</td><td>"+(e.cached?fmt(e.cached,0):"-")+"</td><td>"+fmt(e.prefill_tok_s,0)+"</td><td>"+(e.ttft_ms?fmt(e.ttft_ms,0)+" ms":"-")+"</td><td>"+fmt(e.tokens,0)+"</td><td>"+fmt(e.tok_s)+"</td></tr>");
+  for(const e of s.last.slice(0,15))rows.push("<tr><td>"+esc(e.start?hms(e.start):"")+"</td><td class='m' title='"+esc(e.path)+"'>"+esc(e.model||e.path)+"</td><td>"+(e.prompt_tokens!=null?(e.prompt_est?"~":"")+fmt(e.prompt_tokens,0):"-")+"</td><td>"+(e.cached?fmt(e.cached,0):"-")+"</td><td>"+(e.prefill_tok_s!=null?fmt(e.prefill_tok_s,0):(e.prompt_tokens&&e.ttft_ms?"<span style='color:var(--dim)' title='fewer than 128 uncached tokens: the time to first token is overhead, not reading speed'>cache hit</span>":"-"))+(e.effective_tok_s?"<br><span style='color:var(--dim)' title='all prompt tokens / time to first token'>"+fmt(e.effective_tok_s,0)+" eff.</span>":"")+"</td><td>"+(e.ttft_ms?fmt(e.ttft_ms,0)+" ms":"-")+"</td><td>"+fmt(e.tokens,0)+"</td><td>"+fmt(e.tok_s)+"</td></tr>");
   $("rows").innerHTML=rows.join("")||"<tr><td colspan='8' style='text-align:center;color:var(--dim)'>no requests yet</td></tr>";
 }
 let busy=false;
@@ -665,7 +676,7 @@ class H(BaseHTTPRequestHandler):
                     e["prompt_tokens"], e["cached"], e["prompt_est"] = p_est, 0, True
                 else:
                     e["prompt_est"] = False
-                e["new_tokens"], e["prefill_tok_s"] = prefill_stats(e.get("prompt_tokens"), e.get("cached"), e["ttft_ms"])
+                e["new_tokens"], e["prefill_tok_s"], e["effective_tok_s"] = prefill_stats(e.get("prompt_tokens"), e.get("cached"), e["ttft_ms"])
                 record({k: v for k, v in e.items() if k not in ("t0", "out", "prompt_guess")})
                 dump(body, e, e["out"])
             finally:
@@ -703,6 +714,10 @@ class H(BaseHTTPRequestHandler):
 
 
 def selftest():
+    assert prefill_stats(485, 484, 117) == (1, None, 4145), prefill_stats(485, 484, 117)      # cache hit: no prefill rate
+    assert prefill_stats(16720, 4947, 18875) == (11773, 624, 886), prefill_stats(16720, 4947, 18875)
+    assert prefill_stats(40, 0, 280) == (40, None, 143)                                         # tiny prompt: overhead only
+    assert prefill_stats(None, None, 0) == (0, None, None)
     ev = ch = us = 0
     for line in (b'data: {"choices":[{"delta":{"content":"Hello"}}]}\n',
                  b'data: {"choices":[{"delta":{"reasoning_content":" think"}}]}\n',
@@ -720,9 +735,9 @@ def selftest():
     assert (n, txt, usage_numbers(u)) == (0, "", (38, 24, 10)), (n, txt, u)
     assert usage_numbers(None) == (0, None, None)
     # prefill: only the tokens that were really read count, over the time to the first token
-    assert prefill_stats(1000, 0, 500) == (1000, 2000)
-    assert prefill_stats(1000, 900, 500) == (100, 200)
-    assert prefill_stats(50, 50, 500) == (0, None) and prefill_stats(None, None, 500) == (0, None)
+    assert prefill_stats(1000, 0, 500) == (1000, 2000, 2000)
+    assert prefill_stats(1000, 900, 500) == (100, None, 2000)          # 100 new tokens: below MIN_PREFILL_NEW
+    assert prefill_stats(50, 50, 500) == (0, None, 100) and prefill_stats(None, None, 500) == (0, None, None)
     assert prompt_estimate(json.dumps({"messages": [{"role": "user", "content": "x" * 400}]})) == 100
     assert prompt_estimate(b"not json") == 0
     # decode curve: 40 tokens at a steady 20 tok/s -> every point 20, windows of >= 10 tokens

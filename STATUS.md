@@ -10,5 +10,7 @@ _Last updated 2026-11-21_
 - Started with no arguments, it reuses the last start parameters (`~/.cache/llmproxy/last.json`).
 - Tests: `python3 llmproxy.py --selftest` (it also runs the dashboard script under node when node is installed).
 
+- Prefill: cache hits (< 128 uncached tokens) are left out of the prefill charts and labelled in the table; the effective rate over all prompt tokens is shown next to it (2026-11-24). The running proxy picks this up at its next restart.
+
 ## Open
 - `pi-proxy.py`, `tsp.js` and `x.txt` are unrelated leftovers from the original import.
