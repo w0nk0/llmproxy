@@ -1,6 +1,6 @@
 # Status
 
-_Last updated 2026-11-21_
+_Last updated 2026-11-25_
 
 - `llmproxy.py`: a single-file logging proxy for an OpenAI-compatible LLM server, with token-speed
   stats (`/stats`), a live dashboard (`/`) and chat commands (`/tps`, `%tps_all`, ...).
@@ -13,4 +13,5 @@ _Last updated 2026-11-21_
 - Prefill: cache hits (< 128 uncached tokens) are left out of the prefill charts and labelled in the table; the effective rate over all prompt tokens is shown next to it (2026-11-24). The running proxy picks this up at its next restart.
 
 ## Open
-- `pi-proxy.py`, `tsp.js` and `x.txt` are unrelated leftovers from the original import.
+- `pi-proxy.py` points the pi agent through the proxy; `tsp.js` (unrelated leftover) was removed.
+- Public at https://github.com/w0nk0/llmproxy; on the PATH as `llmproxy` (symlink in `~/.local/bin`). Default log dir `~/.local/state/llmproxy`; an upstream ending in `/v1` no longer doubles the path (2026-11-25).

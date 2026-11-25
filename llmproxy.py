@@ -17,7 +17,9 @@ one JSON line: prompt in, response out, token stats.
 import os, sys, json, time, socket, urllib.request, urllib.error, urllib.parse, itertools, collections
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-DEFAULTS = ["http://localhost:8080", "8787", "."]
+# logs hold full prompts: keep them in one private place, not in whatever directory the proxy was started from
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "llmproxy")
+DEFAULTS = ["http://localhost:8080", "8787", STATE]
 CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
                      "llmproxy", "last.json")
 
@@ -47,6 +49,8 @@ FROM_CACHE = not ARGS and load_cached()      # started without parameters: reuse
 # missing trailing arguments fall back to the defaults
 UPSTREAM, PORT, LOGDIR = (FROM_CACHE or ARGS + DEFAULTS[len(ARGS):])[:3]
 PORT = int(PORT)
+UPSTREAM = UPSTREAM.rstrip("/")
+os.makedirs(LOGDIR, exist_ok=True)
 P = urllib.parse.urlparse(UPSTREAM)
 LOGFILE = (LOGDIR.rstrip("/") + f"/llmproxy-{time.strftime('%Y%m%d-%H%M%S')}-"
            f"{P.port or (443 if P.scheme == 'https' else 80)}.jsonl")
@@ -606,7 +610,7 @@ class H(BaseHTTPRequestHandler):
             return self.wfile.write(data)
 
         headers = {k: v for k, v in self.headers.items() if k.lower() not in DROP}
-        req = urllib.request.Request(UPSTREAM + self.path, body or None, headers, method=self.command)
+        req = urllib.request.Request(upstream_url(self.path), body or None, headers, method=self.command)
         t0 = time.time()
         model = ""
         try:
@@ -711,6 +715,13 @@ class H(BaseHTTPRequestHandler):
                 dump(body, entry, out)
 
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_HEAD = route
+
+
+def upstream_url(path):
+    """UPSTREAM + path, without a doubled /v1 when the upstream was given as http://host:port/v1."""
+    if UPSTREAM.endswith("/v1") and (path == "/v1" or path.startswith("/v1/")):
+        return UPSTREAM[:-3] + path
+    return UPSTREAM + path
 
 
 def selftest():
@@ -828,6 +839,13 @@ if(yscale(5000,0,100,false).log)throw new Error("prefill chart stays linear");
     assert json.loads(completion("x", "m", False))["choices"][0]["message"]["content"] == "x"
     assert completion("x", "m", True).endswith(b"data: [DONE]\n\n")
     assert load_cached is not None and DEFAULTS[1] == "8787"
+    global UPSTREAM
+    saved, UPSTREAM = UPSTREAM, "http://h:1/v1"
+    assert upstream_url("/v1/chat/completions") == "http://h:1/v1/chat/completions"
+    assert upstream_url("/chat/completions") == "http://h:1/v1/chat/completions"
+    UPSTREAM = "http://h:1"
+    assert upstream_url("/v1/models") == "http://h:1/v1/models"
+    UPSTREAM = saved
     print("selftest ok")
 
 

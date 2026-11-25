@@ -6,3 +6,6 @@
 - **Prefill goes on its own right-hand scale.** Prefill is typically 10-100x the decode speed, so the two can't share an axis.
 - **Request logs are not committed** (`*.jsonl` in `.gitignore`), because they hold full prompts in clear text.
 - **Prefill tok/s counts only uncached prompt tokens, and skips cache hits (2026-11-24).** Cached tokens are not recomputed, so counting them would make the rate follow the cache, not the reading speed (a 16,720-token prompt with 4,947 cached: 624 tok/s real, 886 if all counted). Requests with fewer than 128 uncached tokens are left out of the prefill charts and shown as "cache hit": their time to first token is fixed overhead (1 new token in 117 ms showed as 9 tok/s). The effective rate (all prompt tokens / time to first token, what a user feels) is shown in the hover and the table and written to the log as `effective_tok_s`.
+
+- **Default log dir is `~/.local/state/llmproxy`, not `.` (2026-11-25).** As a command on the PATH it is started from anywhere; with `.` the prompt logs (full prompts in the clear) would be scattered over whatever directories it was started in.
+- **A trailing `/v1` on the upstream is tolerated (2026-11-25).** `UPSTREAM + path` turned `http://host/v1` + `/v1/chat/completions` into a 404 on `/v1/v1/...`; a doubled `/v1` is now dropped.

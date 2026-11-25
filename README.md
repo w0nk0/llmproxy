@@ -10,10 +10,20 @@ It sits in front of any OpenAI-compatible server (LM Studio, llama-server, ollam
    directly, so any OpenAI-compatible client works unchanged.
 2. **Measures generation speed** and shows it on a tiny web page.
 
+## Install
+
+No dependencies. Put it on your PATH once and call it from anywhere:
+
+```bash
+git clone https://github.com/w0nk0/llmproxy ~/projects/LLMproxy
+ln -s ~/projects/LLMproxy/llmproxy.py ~/.local/bin/llmproxy
+llmproxy http://127.0.0.1:8080 8181
+```
+
 ## Run
 
 ```bash
-python3 ~/projects/LLMproxy/llmproxy.py                                  # upstream :8080, proxy :8787, log .
+python3 ~/projects/LLMproxy/llmproxy.py                                  # upstream :8080, proxy :8787
 python3 ~/projects/LLMproxy/llmproxy.py http://localhost:11434 8790      # ollama, other port
 python3 ~/projects/LLMproxy/llmproxy.py http://127.0.0.1:8899 8787 ~/logs
 ```
@@ -22,7 +32,7 @@ python3 ~/projects/LLMproxy/llmproxy.py http://127.0.0.1:8899 8787 ~/logs
 |-----|---------|---------|
 | 1 `upstream` | `http://localhost:8080` | base URL of the LLM server |
 | 2 `port` | `8787` | port the proxy listens on |
-| 3 `logdir` | `.` (current dir) | directory for the request/response log |
+| 3 `logdir` | `~/.local/state/llmproxy` (or `$XDG_STATE_HOME/llmproxy`) | directory for the request/response log; it holds full prompts |
 
 The proxy listens on all interfaces, IPv4 and IPv6.
 
@@ -137,3 +147,5 @@ Not covered: opencode (its `~/.config/opencode/opencode.jsonc` has no provider t
 adding one is a different edit), and claude / codex, whose clients speak the Anthropic or
 Codex wire APIs that a byte-for-byte OpenAI proxy cannot serve. Ask if you want those wired
 up; they need a translating proxy, not this one.
+
+The upstream may be given with or without a trailing `/v1`: `http://host:8080/v1` and `http://host:8080` both work for clients that call `/v1/chat/completions`.
