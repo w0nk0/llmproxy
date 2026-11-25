@@ -50,6 +50,9 @@ FROM_CACHE = not ARGS and load_cached()      # started without parameters: reuse
 UPSTREAM, PORT, LOGDIR = (FROM_CACHE or ARGS + DEFAULTS[len(ARGS):])[:3]
 PORT = int(PORT)
 UPSTREAM = UPSTREAM.rstrip("/")
+if UPSTREAM.endswith("/v1") and not SELFTEST:
+    print(f"proxy: upstream {UPSTREAM} ends in /v1; fixing it: /v1/... requests go to {UPSTREAM[:-3]}/v1/..., "
+          f"requests without /v1 get it added")
 os.makedirs(LOGDIR, exist_ok=True)
 P = urllib.parse.urlparse(UPSTREAM)
 LOGFILE = (LOGDIR.rstrip("/") + f"/llmproxy-{time.strftime('%Y%m%d-%H%M%S')}-"
